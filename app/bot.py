@@ -4,7 +4,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from dotenv import load_dotenv
 from .db import (
     init_db, close_db, ensure_user, get_user, get_services, get_service, create_order,
@@ -29,6 +29,8 @@ if not TOKEN:
 dp = Dispatcher()
 dp.include_router(admin_router)
 
+START_BANNER_PATH = os.path.join(os.path.dirname(__file__), "assets", "start_banner.png")
+
 class UserStates(StatesGroup):
     waiting_order_amount = State()
     executor_experience = State()
@@ -45,9 +47,7 @@ def menu(user_id=None, role=None):
         InlineKeyboardButton(text="🧑‍💼 Стать исполнителем", callback_data="executor")
     )
     kb = [
-        [InlineKeyboardButton(text="💰 Баланс", callback_data="balance"),
-         InlineKeyboardButton(text="🛒 Услуги", callback_data="services")],
-        [InlineKeyboardButton(text="📋 Мои заявки", callback_data="orders"),
+        [InlineKeyboardButton(text="🛒 Услуги", callback_data="services"),
          InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
         [executor_button,
          InlineKeyboardButton(text="🆘 Поддержка", callback_data="support")],
@@ -128,6 +128,10 @@ async def start(m: Message):
     await ensure_user(m.from_user.id, m.from_user.username)
     user = await get_user(m.from_user.id)
     rate = get_exchange_rate()
+    try:
+        await m.answer_photo(FSInputFile(START_BANNER_PATH))
+    except Exception as e:
+        print(f"[start banner] {e}")
     await m.answer(
         f"👋 Добро пожаловать в <b>TornadoPay</b>!\n\n"
         f"Маркетплейс услуг с оплатой в криптовалюте.\n"
@@ -150,14 +154,16 @@ async def profile(c: CallbackQuery):
     if not u:
         await c.answer("Профиль не найден.", show_alert=True)
         return
-    kb = InlineKeyboardMarkup(inline_keyboard=[
+    kb_rows = [
         [InlineKeyboardButton(text="📋 Мои заявки", callback_data="orders")],
         [InlineKeyboardButton(text="💰 Баланс", callback_data="balance")],
         [InlineKeyboardButton(text="📊 История операций", callback_data="profile:transactions")],
         [InlineKeyboardButton(text="💳 Пополнить", callback_data="profile:deposit")],
-        [InlineKeyboardButton(text="💸 Вывести", callback_data="profile:withdraw")],
-        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back")],
-    ])
+    ]
+    if u[3] == "executor":
+        kb_rows.append([InlineKeyboardButton(text="💸 Вывести", callback_data="exec:withdraw")])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back")])
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     role_label = "Исполнитель" if u[3] == "executor" else "Пользователь"
     await c.message.edit_text(
         f"👤 <b>Личный кабинет</b>\n\n"
@@ -185,14 +191,6 @@ async def profile_transactions(c: CallbackQuery):
 @dp.callback_query(F.data == "profile:deposit")
 async def profile_deposit(c: CallbackQuery):
     await c.answer("Пополнение будет подключено на этапе интеграции CryptoBot/xRocket.", show_alert=True)
-
-@dp.callback_query(F.data == "profile:withdraw")
-async def profile_withdraw(c: CallbackQuery):
-    u = await get_user(c.from_user.id)
-    if u and u[3] == "executor":
-        await c.message.edit_text("💸 <b>Вывод</b>\n\nДля исполнителя вывод доступен через кабинет исполнителя.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🧑‍💼 ЛК Исполнителя", callback_data="executor")]]), parse_mode="HTML")
-    else:
-        await c.answer("Вывод для пользователя будет подключён на этапе интеграции CryptoBot/xRocket.", show_alert=True)
 
 @dp.callback_query(F.data == "services")
 async def services(c: CallbackQuery):

@@ -484,6 +484,14 @@ async def get_executor_history(executor_id, limit=30):
                ORDER BY o.id DESC LIMIT $2""", executor_id, limit
         )
 
+async def get_withdrawal(withdrawal_id):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            """SELECT w.id, w.user_id, u.username, w.amount, w.status, w.created_at
+               FROM withdrawal_requests w JOIN users u ON u.user_id=w.user_id
+               WHERE w.id=$1""", withdrawal_id
+        )
+
 async def get_pending_withdrawals(limit=30):
     async with pool.acquire() as conn:
         return await conn.fetch(
@@ -828,22 +836,31 @@ async def dispute_order_by_admin(order_id):
         return row[0] if row else None
 
 async def set_order_status(order_id, status):
+    """Возвращает True, если статус реально изменён, и False, если заявку
+    нельзя перевести в этот статус (уже завершена/отменена и т.п.) —
+    в этом случае строка НЕ трогается, чтобы не рассинхронизировать
+    статус с уже выплаченными/возвращёнными деньгами."""
     async with pool.acquire() as conn:
         async with conn.transaction():
             if status == "done":
                 status = "awaiting_confirmation"
             if status == "cancelled":
                 row = await conn.fetchrow("SELECT user_id, escrow_amount_usdt, status FROM orders WHERE id=$1 FOR UPDATE", order_id)
-                if row and float(row[1]) > 0 and row[2] not in ('done','cancelled'):
-                    refund = float(row[1])
+                if not row or row[2] in ('done', 'cancelled'):
+                    # Заявка уже финализирована (деньги выплачены/возвращены) —
+                    # статус трогать нельзя, иначе он разъедется с фактом выплаты.
+                    return False
+                refund = float(row[1])
+                if refund > 0:
                     await conn.execute("UPDATE users SET balance=balance+$1 WHERE user_id=$2", refund, row[0])
                     await conn.execute("INSERT INTO transactions(user_id,order_id,amount,type,description) VALUES($1,$2,$3,'escrow_refund',$4)", row[0], order_id, refund, f"Возврат по отменённой заявке #{order_id}")
-                    await conn.execute("UPDATE orders SET escrow_amount_usdt=0, status='cancelled', settled_at=now(), settlement_for='cancelled' WHERE id=$1", order_id)
-                    return
+                await conn.execute("UPDATE orders SET escrow_amount_usdt=0, status='cancelled', settled_at=now(), settlement_for='cancelled' WHERE id=$1", order_id)
+                return True
             if status == "awaiting_confirmation":
-                await conn.execute("UPDATE orders SET status=$1, completed_at=COALESCE(completed_at, now()) WHERE id=$2", status, order_id)
+                result = await conn.execute("UPDATE orders SET status=$1, completed_at=COALESCE(completed_at, now()) WHERE id=$2 AND status NOT IN ('done','cancelled')", status, order_id)
             else:
-                await conn.execute("UPDATE orders SET status=$1, settlement_for=CASE WHEN $1='cancelled' THEN 'cancelled' ELSE settlement_for END WHERE id=$2", status, order_id)
+                result = await conn.execute("UPDATE orders SET status=$1, settlement_for=CASE WHEN $1='cancelled' THEN 'cancelled' ELSE settlement_for END WHERE id=$2 AND status NOT IN ('done','cancelled')", status, order_id)
+            return result.split()[-1] != "0"
 
 async def assign_executor(order_id, executor_id):
     async with pool.acquire() as conn:
