@@ -1,11 +1,46 @@
 import os
 import asyncpg
+import aiohttp
+import asyncio
+from datetime import datetime
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
 pool: asyncpg.Pool | None = None
+current_exchange_rate: float = 100.0  # RUB per 1 USDT (default)
+
+async def fetch_exchange_rate():
+    """Получить текущий курс USDT/RUB из CoinGecko"""
+    global current_exchange_rate
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                "https://api.coingecko.com/api/v3/simple/price?ids=tether&vs_currencies=rub"
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    rate = data.get("tether", {}).get("rub")
+                    if rate:
+                        current_exchange_rate = float(rate)
+                        print(f"[Exchange Rate] Updated: 1 USDT = {current_exchange_rate:.2f} RUB")
+    except Exception as e:
+        print(f"[Exchange Rate Error] {e}")
+
+async def start_exchange_rate_updater():
+    """Фоновая задача: обновлять курс каждые 5 минут"""
+    while True:
+        try:
+            await fetch_exchange_rate()
+            await asyncio.sleep(300)  # 5 минут
+        except Exception as e:
+            print(f"[Exchange Rate Updater Error] {e}")
+            await asyncio.sleep(300)
+
+def get_exchange_rate():
+    """Получить текущий курс"""
+    return current_exchange_rate
 
 async def init_db():
     global pool
@@ -39,10 +74,12 @@ async def init_db():
             id SERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL REFERENCES users(user_id),
             service_id INTEGER NOT NULL REFERENCES services(id),
-            user_amount NUMERIC(14,2) NOT NULL,
-            total_amount NUMERIC(14,2) NOT NULL,
-            owner_commission_amount NUMERIC(14,2) NOT NULL,
-            executor_commission_amount NUMERIC(14,2) NOT NULL,
+            amount_rub NUMERIC(14,2) NOT NULL,
+            exchange_rate NUMERIC(14,4) NOT NULL,
+            user_amount_usdt NUMERIC(14,4) NOT NULL,
+            total_amount_usdt NUMERIC(14,4) NOT NULL,
+            owner_commission_amount NUMERIC(14,4) NOT NULL,
+            executor_commission_amount NUMERIC(14,4) NOT NULL,
             status TEXT NOT NULL DEFAULT 'new',
             executor_id BIGINT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
@@ -54,11 +91,14 @@ async def init_db():
             await conn.executemany(
                 "INSERT INTO services(name, description, min_amount, owner_commission, executor_commission) VALUES($1, $2, $3, $4, $5)",
                 [
-                    ("📱 Пополнение мобильного", "Пополнение номера телефона", 1.0, 5.0, 5.0),
-                    ("🧾 Оплата по QR", "Оплата по предоставленному QR-коду", 1.0, 5.0, 5.0),
-                    ("💳 Перевод на карту", "Перевод средств на банковскую карту", 1.0, 5.0, 5.0),
+                    ("📱 Пополнение мобильного", "Пополнение номера телефона", 10.0, 5.0, 5.0),
+                    ("🧾 Оплата по QR", "Оплата по предоставленному QR-коду", 10.0, 5.0, 5.0),
+                    ("💳 Перевод на карту", "Перевод средств на банковскую карту", 10.0, 5.0, 5.0),
                 ],
             )
+        
+        # Первый fetch курса
+        await fetch_exchange_rate()
 
 async def close_db():
     if pool is not None:
@@ -92,11 +132,10 @@ async def get_service(service_id):
             service_id,
         )
 
-async def create_order(user_id, service_id, user_amount):
+async def create_order(user_id, service_id, amount_rub):
     """
-    Создаёт заявку с расчётом комиссии.
-    user_amount - сумма, которую вводит пользователь
-    total_amount = user_amount + комиссия
+    Создаёт заявку с конвертацией рублей в USDT.
+    amount_rub - сумма в рублях, которую вводит пользователь
     """
     async with pool.acquire() as conn:
         # Получаем параметры услуги
@@ -111,18 +150,24 @@ async def create_order(user_id, service_id, user_amount):
         executor_comm = float(service[1])
         total_comm = owner_comm + executor_comm
         
-        # Расчёт сумм
-        user_amount = float(user_amount)
-        commission = user_amount * (total_comm / 100)
-        total_amount = user_amount + commission
-        owner_commission_amount = user_amount * (owner_comm / 100)
-        executor_commission_amount = user_amount * (executor_comm / 100)
+        # Конвертируем рубли в USDT
+        rate = get_exchange_rate()
+        amount_rub = float(amount_rub)
+        user_amount_usdt = amount_rub / rate
+        
+        # Расчёт комиссии в USDT
+        commission_usdt = user_amount_usdt * (total_comm / 100)
+        total_amount_usdt = user_amount_usdt + commission_usdt
+        owner_commission_amount = user_amount_usdt * (owner_comm / 100)
+        executor_commission_amount = user_amount_usdt * (executor_comm / 100)
         
         order_id = await conn.fetchval(
-            """INSERT INTO orders(user_id, service_id, user_amount, total_amount, 
+            """INSERT INTO orders(user_id, service_id, amount_rub, exchange_rate,
+                                   user_amount_usdt, total_amount_usdt, 
                                    owner_commission_amount, executor_commission_amount) 
-               VALUES($1, $2, $3, $4, $5, $6) RETURNING id""",
-            user_id, service_id, user_amount, total_amount, 
+               VALUES($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id""",
+            user_id, service_id, amount_rub, rate,
+            user_amount_usdt, total_amount_usdt,
             owner_commission_amount, executor_commission_amount
         )
         return order_id
@@ -130,7 +175,7 @@ async def create_order(user_id, service_id, user_amount):
 async def get_orders(user_id):
     async with pool.acquire() as conn:
         return await conn.fetch(
-            """SELECT o.id, s.name, o.user_amount, o.total_amount, o.status, o.executor_id, o.created_at
+            """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt, o.status, o.executor_id, o.created_at
                FROM orders o JOIN services s ON s.id = o.service_id
                WHERE o.user_id = $1 ORDER BY o.id DESC LIMIT 20""",
             user_id,
@@ -190,7 +235,7 @@ ORDER_STATUS_LABELS = {
 async def get_orders_by_status(status, limit=15):
     async with pool.acquire() as conn:
         return await conn.fetch(
-            """SELECT o.id, o.user_id, u.username, s.name, o.user_amount, o.total_amount, 
+            """SELECT o.id, o.user_id, u.username, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
                       o.owner_commission_amount, o.executor_commission_amount, o.status,
                       o.executor_id, o.created_at
                FROM orders o
@@ -204,7 +249,7 @@ async def get_orders_by_status(status, limit=15):
 async def get_order(order_id):
     async with pool.acquire() as conn:
         return await conn.fetchrow(
-            """SELECT o.id, o.user_id, u.username, s.name, o.user_amount, o.total_amount,
+            """SELECT o.id, o.user_id, u.username, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
                       o.owner_commission_amount, o.executor_commission_amount, o.status,
                       o.executor_id, o.created_at
                FROM orders o
