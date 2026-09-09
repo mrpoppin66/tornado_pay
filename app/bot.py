@@ -7,12 +7,17 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
 from .db import (
+<<<<<<< HEAD
     init_db, close_db, ensure_user, get_user, get_services, get_service, create_order,
     get_orders, ORDER_STATUS_LABELS, get_exchange_rate, start_exchange_rate_updater,
     get_active_executor_application, get_latest_executor_application,
     create_executor_application, answer_executor_application,
     EXECUTOR_APPLICATION_STATUSES, get_free_orders, claim_order, complete_executor_order,
     confirm_order_by_client, dispute_order_by_client,
+=======
+    init_db, close_db, ensure_user, get_user, get_services, get_service, create_order, 
+    get_orders, ORDER_STATUS_LABELS, get_exchange_rate, start_exchange_rate_updater,
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
 )
 from .admin import admin_router, ADMIN_IDS
 
@@ -26,10 +31,13 @@ dp.include_router(admin_router)
 
 class UserStates(StatesGroup):
     waiting_order_amount = State()
+<<<<<<< HEAD
     executor_experience = State()
     executor_services = State()
     executor_comment = State()
     executor_answer = State()
+=======
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
 
 def menu(user_id=None):
     kb = [
@@ -86,7 +94,11 @@ async def services(c: CallbackQuery):
     for x in rows:
         min_rub = float(x[3]) * rate
         min_rub_text.append(f"{x[1]} (мин. {x[3]:.2f} USDT / ~{min_rub:.0f} RUB)")
+<<<<<<< HEAD
 
+=======
+    
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
     kb = [[InlineKeyboardButton(text=text, callback_data=f"svc:{rows[i][0]}")] for i, text in enumerate(min_rub_text)]
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
     await c.message.edit_text(
@@ -101,6 +113,7 @@ async def service_select(c: CallbackQuery, state: FSMContext):
     if not service:
         await c.answer("Услуга не найдена", show_alert=True)
         return
+<<<<<<< HEAD
 
     rate = get_exchange_rate()
     await state.update_data(service_id=sid, service_name=service[1],
@@ -112,6 +125,20 @@ async def service_select(c: CallbackQuery, state: FSMContext):
     total_comm = float(service[4]) + float(service[5])
     min_rub = float(service[3]) * rate
 
+=======
+    
+    rate = get_exchange_rate()
+    await state.update_data(service_id=sid, service_name=service[1], 
+                           min_amount_usdt=float(service[3]), 
+                           owner_comm=float(service[4]),
+                           executor_comm=float(service[5]),
+                           exchange_rate=rate)
+    await state.set_state(UserStates.waiting_order_amount)
+    
+    total_comm = float(service[4]) + float(service[5])
+    min_rub = float(service[3]) * rate
+    
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
     await c.message.edit_text(
         f"🛒 <b>{service[1]}</b>\n\n"
         f"{service[2]}\n\n"
@@ -129,12 +156,17 @@ async def order_amount(m: Message, state: FSMContext):
     if not m.text:
         await m.answer("Пришлите сумму числом.")
         return
+<<<<<<< HEAD
 
+=======
+    
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
     try:
         amount_rub = float(m.text.strip().replace(",", "."))
     except ValueError:
         await m.answer("Неверный формат. Пришлите сумму числом (например 300 или 150.50).")
         return
+<<<<<<< HEAD
 
     data = await state.get_data()
     # Курс фиксируется в момент создания заявки: один и тот же
@@ -162,11 +194,39 @@ async def order_amount(m: Message, state: FSMContext):
     total_comm = owner_comm + executor_comm
 
     # Конвертируем в USDT по тому же зафиксированному курсу
+=======
+    
+    data = await state.get_data()
+    rate = data["exchange_rate"]
+    min_amount_usdt = float(data["min_amount_usdt"])
+    min_rub = min_amount_usdt * rate
+    
+    if amount_rub < min_rub:
+        await m.answer(f"❌ Минимальная сумма: {min_rub:.2f} RUB ({min_amount_usdt:.2f} USDT)")
+        return
+    
+    # Создаём заявку
+    oid = await create_order(m.from_user.id, data["service_id"], amount_rub)
+    if not oid:
+        await m.answer("❌ Ошибка при создании заявки. Попробуйте ещё раз.")
+        await state.clear()
+        return
+    
+    owner_comm = float(data["owner_comm"])
+    executor_comm = float(data["executor_comm"])
+    total_comm = owner_comm + executor_comm
+    
+    # Конвертируем в USDT
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
     user_amount_usdt = amount_rub / rate
     commission_usdt = user_amount_usdt * (total_comm / 100)
     total_amount_usdt = user_amount_usdt + commission_usdt
     executor_amount_usdt = user_amount_usdt + (user_amount_usdt * (executor_comm / 100))
+<<<<<<< HEAD
 
+=======
+    
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
     await state.clear()
     await m.answer(
         f"🧾 <b>Заявка #{oid}</b>\n\n"
@@ -179,7 +239,11 @@ async def order_amount(m: Message, state: FSMContext):
         f"<b>Для исполнителя:</b>\n"
         f"К выполнению: {amount_rub:.2f} RUB\n"
         f"Получит: {executor_amount_usdt:.4f} USDT\n\n"
+<<<<<<< HEAD
         f"Курс {rate:.2f} RUB/USDT зафиксирован. Ожидание исполнителя...",
+=======
+        f"Курс фиксирован. Ожидание исполнителя...",
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
         reply_markup=back(), parse_mode="HTML")
 
 @dp.callback_query(F.data == "orders")
@@ -507,11 +571,19 @@ async def go_back(c: CallbackQuery, state: FSMContext):
 
 async def main():
     await init_db()
+<<<<<<< HEAD
 
     # Запускаем фоновое обновление курса
     import asyncio
     asyncio.create_task(start_exchange_rate_updater())
 
+=======
+    
+    # Запускаем фоновое обновление курса
+    import asyncio
+    asyncio.create_task(start_exchange_rate_updater())
+    
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
     bot = Bot(TOKEN)
     try:
         await dp.start_polling(bot)

@@ -41,6 +41,7 @@ async def start_exchange_rate_updater():
 def get_exchange_rate():
     """Получить текущий курс"""
     return current_exchange_rate
+<<<<<<< HEAD
 
 async def _add_column_if_missing(conn, table: str, column: str, ddl: str):
     """Безопасная миграция: добавить колонку, если её ещё нет."""
@@ -53,12 +54,24 @@ async def _add_column_if_missing(conn, table: str, column: str, ddl: str):
     if not exists:
         await conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {ddl}")
         print(f"[Migration] {table}.{column} добавлена")
+=======
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
 
 async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     async with pool.acquire() as conn:
+<<<<<<< HEAD
         # ВАЖНО: никаких DROP TABLE — данные должны переживать редеплой.
+=======
+        # Удаляем старые таблицы (миграция)
+        await conn.execute("DROP TABLE IF EXISTS ratings CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS orders CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS services CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS users CASCADE")
+        
+        # Создаём таблицы с новой схемой
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users(
             user_id BIGINT PRIMARY KEY,
@@ -69,7 +82,10 @@ async def init_db():
             executor_description TEXT,
             executor_city TEXT,
             executor_available BOOLEAN NOT NULL DEFAULT FALSE,
+<<<<<<< HEAD
             executor_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+=======
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE TABLE IF NOT EXISTS services(
@@ -95,6 +111,7 @@ async def init_db():
             status TEXT NOT NULL DEFAULT 'new',
             executor_id BIGINT REFERENCES users(user_id),
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+<<<<<<< HEAD
             completed_at TIMESTAMPTZ,
             confirmed_at TIMESTAMPTZ,
             disputed_at TIMESTAMPTZ,
@@ -122,6 +139,9 @@ async def init_db():
             type TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+=======
+            completed_at TIMESTAMPTZ
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
         );
         CREATE TABLE IF NOT EXISTS ratings(
             id SERIAL PRIMARY KEY,
@@ -133,6 +153,7 @@ async def init_db():
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         """)
+<<<<<<< HEAD
 
         # Миграции для старых баз: добавляем колонки, которых может не хватать
         await _add_column_if_missing(conn, "users", "role", "TEXT NOT NULL DEFAULT 'client'")
@@ -153,6 +174,9 @@ async def init_db():
         await _add_column_if_missing(conn, "orders", "settled_at", "TIMESTAMPTZ")
         await _add_column_if_missing(conn, "orders", "escrow_amount_usdt", "NUMERIC(18,4) NOT NULL DEFAULT 0")
 
+=======
+        
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
         count = await conn.fetchval("SELECT COUNT(*) FROM services")
         if count == 0:
             await conn.executemany(
@@ -163,6 +187,9 @@ async def init_db():
                     ("💳 Перевод на карту", "Перевод средств на банковскую карту", 10.0, 5.0, 5.0),
                 ],
             )
+        
+        # Первый fetch курса
+        await fetch_exchange_rate()
 
         # Первый fetch курса
         await fetch_exchange_rate()
@@ -199,6 +226,7 @@ async def get_service(service_id):
             service_id,
         )
 
+<<<<<<< HEAD
 async def create_order(user_id, service_id, amount_rub, rate=None):
     """Create an order and reserve the full client payment in escrow."""
     async with pool.acquire() as conn:
@@ -229,6 +257,47 @@ async def create_order(user_id, service_id, amount_rub, rate=None):
             await conn.execute("UPDATE users SET balance=balance-$1 WHERE user_id=$2", total_amount_usdt, user_id)
             await conn.execute("INSERT INTO transactions(user_id,order_id,amount,type,description) VALUES($1,$2,$3,'escrow_hold',$4)", user_id, order_id, -total_amount_usdt, f"Резерв по заявке #{order_id}")
             return order_id, "ok"
+=======
+async def create_order(user_id, service_id, amount_rub):
+    """
+    Создаёт заявку с конвертацией рублей в USDT.
+    amount_rub - сумма в рублях, которую вводит пользователь
+    """
+    async with pool.acquire() as conn:
+        # Получаем параметры услуги
+        service = await conn.fetchrow(
+            "SELECT owner_commission, executor_commission FROM services WHERE id=$1",
+            service_id
+        )
+        if not service:
+            return None
+        
+        owner_comm = float(service[0])
+        executor_comm = float(service[1])
+        total_comm = owner_comm + executor_comm
+        
+        # Конвертируем рубли в USDT
+        rate = get_exchange_rate()
+        amount_rub = float(amount_rub)
+        user_amount_usdt = amount_rub / rate
+        
+        # Расчёт комиссии в USDT
+        commission_usdt = user_amount_usdt * (total_comm / 100)
+        total_amount_usdt = user_amount_usdt + commission_usdt
+        owner_commission_amount = user_amount_usdt * (owner_comm / 100)
+        executor_commission_amount = user_amount_usdt * (executor_comm / 100)
+        
+        order_id = await conn.fetchval(
+            """INSERT INTO orders(user_id, service_id, amount_rub, exchange_rate,
+                                   user_amount_usdt, total_amount_usdt, 
+                                   owner_commission_amount, executor_commission_amount) 
+               VALUES($1, $2, $3, $4, $5, $6, $7, $8) RETURNING id""",
+            user_id, service_id, amount_rub, rate,
+            user_amount_usdt, total_amount_usdt,
+            owner_commission_amount, executor_commission_amount
+        )
+        return order_id
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
 
 async def get_orders(user_id):
     async with pool.acquire() as conn:
@@ -245,8 +314,13 @@ async def register_executor(user_id, name, description, city):
     """Зарегистрировать пользователя как исполнителя"""
     async with pool.acquire() as conn:
         await conn.execute(
+<<<<<<< HEAD
             """UPDATE users SET role=$1, executor_name=$2, executor_description=$3,
                executor_city=$4, executor_available=$5
+=======
+            """UPDATE users SET role=$1, executor_name=$2, executor_description=$3, 
+               executor_city=$4, executor_available=$5 
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
                WHERE user_id=$6""",
             "executor", name, description, city, False, user_id
         )
@@ -260,7 +334,11 @@ async def set_executor_available(user_id, available):
         )
 
 async def get_available_executors():
+<<<<<<< HEAD
     """Получить всех доступных исполнителей"""
+=======
+    """Получить в��ех доступных исполнителей"""
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
     async with pool.acquire() as conn:
         return await conn.fetch(
             """SELECT user_id, username, executor_name, executor_description, executor_city
@@ -281,13 +359,18 @@ async def get_executor_stats(executor_id):
         )
         avg_rating = float(rating_data["avg_rating"]) if rating_data["avg_rating"] else 0
         total_ratings = rating_data["total_ratings"] or 0
+<<<<<<< HEAD
 
+=======
+        
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
         return {
             "completed": completed,
             "avg_rating": avg_rating,
             "total_ratings": total_ratings
         }
 
+<<<<<<< HEAD
 async def get_free_orders(limit=20):
     """Получить свободные заявки, доступные исполнителям."""
     async with pool.acquire() as conn:
@@ -355,14 +438,22 @@ async def dispute_order_by_client(order_id, client_id):
                RETURNING executor_id""", order_id, client_id)
         return row[0] if row else None
 
+=======
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
 async def get_executor_orders(executor_id, status=None):
     """Получить заявки исполнителя"""
     async with pool.acquire() as conn:
         if status:
             return await conn.fetch(
+<<<<<<< HEAD
                 """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.status,
                           o.user_id, u.username, o.created_at
                    FROM orders o
+=======
+                """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.status, 
+                          o.user_id, u.username, o.created_at
+                   FROM orders o 
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
                    JOIN services s ON s.id = o.service_id
                    JOIN users u ON u.user_id = o.user_id
                    WHERE o.executor_id=$1 AND o.status=$2
@@ -371,9 +462,15 @@ async def get_executor_orders(executor_id, status=None):
             )
         else:
             return await conn.fetch(
+<<<<<<< HEAD
                 """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.status,
                           o.user_id, u.username, o.created_at
                    FROM orders o
+=======
+                """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.status, 
+                          o.user_id, u.username, o.created_at
+                   FROM orders o 
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
                    JOIN services s ON s.id = o.service_id
                    JOIN users u ON u.user_id = o.user_id
                    WHERE o.executor_id=$1
@@ -381,6 +478,7 @@ async def get_executor_orders(executor_id, status=None):
                 executor_id
             )
 
+<<<<<<< HEAD
 # ---------- Заявки исполнителей ----------
 
 EXECUTOR_APPLICATION_STATUSES = {
@@ -504,6 +602,8 @@ async def unblock_executor(user_id):
         await conn.execute("UPDATE users SET executor_blocked=FALSE, executor_available=FALSE WHERE user_id=$1 AND role='executor'", user_id)
         await conn.execute("UPDATE executor_applications SET status='approved', updated_at=now() WHERE user_id=$1 AND status='blocked'", user_id)
 
+=======
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
 # ---------- Рейтинги ----------
 
 async def add_rating(order_id, from_user_id, to_user_id, stars, comment=""):
@@ -534,7 +634,11 @@ async def list_services_admin():
 async def add_service(name, description, min_amount, owner_commission, executor_commission):
     async with pool.acquire() as conn:
         return await conn.fetchval(
+<<<<<<< HEAD
             """INSERT INTO services(name, description, min_amount, owner_commission, executor_commission)
+=======
+            """INSERT INTO services(name, description, min_amount, owner_commission, executor_commission) 
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
                VALUES($1, $2, $3, $4, $5) RETURNING id""",
             name, description, min_amount, owner_commission, executor_commission,
         )
@@ -637,6 +741,7 @@ async def dispute_order_by_admin(order_id):
 
 async def set_order_status(order_id, status):
     async with pool.acquire() as conn:
+<<<<<<< HEAD
         async with conn.transaction():
             if status == "done":
                 status = "awaiting_confirmation"
@@ -652,6 +757,16 @@ async def set_order_status(order_id, status):
                 await conn.execute("UPDATE orders SET status=$1, completed_at=COALESCE(completed_at, now()) WHERE id=$2", status, order_id)
             else:
                 await conn.execute("UPDATE orders SET status=$1 WHERE id=$2", status, order_id)
+=======
+        if status == "done":
+            await conn.execute(
+                "UPDATE orders SET status=$1, completed_at=now() WHERE id=$2", status, order_id
+            )
+        else:
+            await conn.execute(
+                "UPDATE orders SET status=$1 WHERE id=$2", status, order_id
+            )
+>>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
 
 async def assign_executor(order_id, executor_id):
     async with pool.acquire() as conn:
