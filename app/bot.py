@@ -7,7 +7,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
 from dotenv import load_dotenv
 from .db import (
-    init_db, close_db, ensure_user, get_user, get_services, get_service, create_order,
+    init_db, close_db, ensure_user, get_user, get_services, get_service, create_order, calculate_order_commission,
     get_orders, ORDER_STATUS_LABELS, get_exchange_rate, start_exchange_rate_updater,
     get_active_executor_application, get_latest_executor_application,
     create_executor_application, answer_executor_application,
@@ -30,6 +30,7 @@ dp = Dispatcher()
 dp.include_router(admin_router)
 
 START_BANNER_PATH = os.path.join(os.path.dirname(__file__), "assets", "start_banner.png")
+SUPPORT_BANNER_PATH = os.path.join(os.path.dirname(__file__), "assets", "support_banner.png")
 
 class UserStates(StatesGroup):
     waiting_order_amount = State()
@@ -298,8 +299,10 @@ async def order_amount(m: Message, state: FSMContext):
     owner_comm = float(data["owner_comm"])
     executor_comm = float(data["executor_comm"])
     user_amount_usdt = amount_rub / rate
-    total_amount_usdt = user_amount_usdt * (1 + (owner_comm + executor_comm) / 100)
-    executor_amount_usdt = user_amount_usdt * (1 + executor_comm / 100)
+    commission_usdt, _owner_commission_amount, _executor_commission_amount = calculate_order_commission(
+        user_amount_usdt, rate, owner_comm, executor_comm
+    )
+    total_amount_usdt = user_amount_usdt + commission_usdt
 
     await state.clear()
     await log_order_event(oid, m.from_user.id, "created", f"Заявка создана: {data['service_name']}")
@@ -781,9 +784,29 @@ async def notifications(c: CallbackQuery):
 
 @dp.callback_query(F.data == "support")
 async def support(c: CallbackQuery):
-    await safe_edit(c,
-        "🆘 <b>Поддержка</b>\n\nСвязь с поддержкой будет добавлена следующим этапом.",
-        reply_markup=back())
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💬 Написать в поддержку", url="https://t.me/tornadopay_suppbot")],
+        [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back")],
+    ])
+    caption = (
+        "🆘 <b>Поддержка TornadoPay</b>\n\n"
+        "Если у вас возник вопрос или нужна помощь — наша поддержка всегда на связи.\n\n"
+        "📩 Контакт поддержки: @tornadopay_suppbot"
+    )
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
+    try:
+        await c.message.answer_photo(
+            FSInputFile(SUPPORT_BANNER_PATH),
+            caption=caption,
+            reply_markup=kb,
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        print(f"[support banner] {e}")
+        await c.message.answer(caption, reply_markup=kb, parse_mode="HTML")
     await c.answer()
 
 @dp.callback_query(F.data == "back")
@@ -791,7 +814,7 @@ async def go_back(c: CallbackQuery, state: FSMContext):
     await state.clear()
     rate = get_exchange_rate()
     u = await get_user(c.from_user.id)
-    await c.message.edit_text(
+    await safe_edit(c,
         f"🏠 <b>TornadoPay</b>\n\n"
         f"Выберите раздел:\n\n"
         f"📊 Курс: 1 USDT = {rate:.2f} RUB",

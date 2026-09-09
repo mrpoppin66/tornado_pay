@@ -11,6 +11,40 @@ if not DATABASE_URL:
 pool: asyncpg.Pool | None = None
 current_exchange_rate: float = 100.0  # RUB per 1 USDT (default)
 
+# Минимальная общая комиссия по любой услуге.
+# Если процентная комиссия меньше этого значения, применяется минимум,
+# а затем он делится между сервисом и исполнителем пропорционально
+# комиссиям, заданным у конкретной услуги.
+MIN_TOTAL_COMMISSION_RUB: float = 25.0
+
+def calculate_order_commission(user_amount_usdt, rate, owner_commission, executor_commission):
+    """Рассчитать общую комиссию и её доли.
+
+    Возвращает: (total_commission_usdt, owner_amount_usdt, executor_amount_usdt).
+    Минимальная общая комиссия — 25 RUB в эквиваленте USDT.
+    При срабатывании минимума сумма делится в том же соотношении,
+    что и настроенные проценты сервиса/исполнителя.
+    """
+    base = float(user_amount_usdt)
+    rate = float(rate)
+    owner_pct = max(0.0, float(owner_commission))
+    executor_pct = max(0.0, float(executor_commission))
+    total_pct = owner_pct + executor_pct
+
+    percentage_commission = base * total_pct / 100.0
+    minimum_commission = MIN_TOTAL_COMMISSION_RUB / rate
+    total_commission = max(percentage_commission, minimum_commission)
+
+    if total_pct > 0:
+        owner_amount = total_commission * owner_pct / total_pct
+        executor_amount = total_commission * executor_pct / total_pct
+    else:
+        # Если проценты ещё не настроены, минимум остаётся комиссией сервиса.
+        owner_amount = total_commission
+        executor_amount = 0.0
+
+    return total_commission, owner_amount, executor_amount
+
 async def fetch_exchange_rate():
     """Получить текущий курс USDT/RUB из CoinGecko"""
     global current_exchange_rate
@@ -287,11 +321,10 @@ async def create_order(user_id, service_id, amount_rub, rate=None):
                 return None, "below_minimum"
             if user_amount_usdt > max_amount + 1e-9:
                 return None, "above_maximum"
-            total_comm = owner_comm + executor_comm
-            commission_usdt = user_amount_usdt * total_comm / 100
+            commission_usdt, owner_amount, executor_amount = calculate_order_commission(
+                user_amount_usdt, rate, owner_comm, executor_comm
+            )
             total_amount_usdt = user_amount_usdt + commission_usdt
-            owner_amount = user_amount_usdt * owner_comm / 100
-            executor_amount = user_amount_usdt * executor_comm / 100
             balance = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1 FOR UPDATE", user_id)
             if balance is None:
                 return None, "user_not_found"
