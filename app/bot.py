@@ -159,7 +159,7 @@ async def start(m: Message):
 @dp.callback_query(F.data == "balance")
 async def balance(c: CallbackQuery):
     u = await get_user(c.from_user.id)
-    await c.message.edit_text(
+    await safe_edit(c,
         f"💰 <b>Баланс</b>\n\n{u[2]:.2f} USDT\n\n"
         "CryptoBot/xRocket подключим следующим этапом.",
         reply_markup=back(), parse_mode="HTML")
@@ -182,7 +182,7 @@ async def profile(c: CallbackQuery):
     kb_rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     role_label = "Исполнитель" if u[3] == "executor" else "Пользователь"
-    await c.message.edit_text(
+    await safe_edit(c,
         f"👤 <b>Личный кабинет</b>\n\n"
         f"ID: <code>{u[0]}</code>\n"
         f"Роль: <b>{role_label}</b>\n"
@@ -200,7 +200,7 @@ async def profile_transactions(c: CallbackQuery):
         for x in rows:
             sign = "+" if float(x[1]) > 0 else ""
             text += f"<b>{sign}{float(x[1]):.4f} USDT</b> — {escape(x[3])}\n{x[4]:%d.%m.%Y %H:%M}\n\n"
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+    await safe_edit(c, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Личный кабинет", callback_data="profile")]
     ]), parse_mode="HTML")
     await c.answer()
