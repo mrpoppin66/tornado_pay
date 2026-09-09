@@ -11,6 +11,12 @@ async def init_db():
     global pool
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     async with pool.acquire() as conn:
+        # Удаляем старые таблицы (миграция)
+        await conn.execute("DROP TABLE IF EXISTS orders CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS services CASCADE")
+        await conn.execute("DROP TABLE IF EXISTS users CASCADE")
+        
+        # Создаём таблицы с новой схемой
         await conn.execute("""
         CREATE TABLE IF NOT EXISTS users(
             user_id BIGINT PRIMARY KEY,
