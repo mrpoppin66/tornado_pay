@@ -47,6 +47,7 @@ async def init_db():
     pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=10)
     async with pool.acquire() as conn:
         # Удаляем старые таблицы (миграция)
+        await conn.execute("DROP TABLE IF EXISTS ratings CASCADE")
         await conn.execute("DROP TABLE IF EXISTS orders CASCADE")
         await conn.execute("DROP TABLE IF EXISTS services CASCADE")
         await conn.execute("DROP TABLE IF EXISTS users CASCADE")
@@ -58,6 +59,10 @@ async def init_db():
             username TEXT,
             balance NUMERIC(14,2) NOT NULL DEFAULT 0,
             role TEXT NOT NULL DEFAULT 'client',
+            executor_name TEXT,
+            executor_description TEXT,
+            executor_city TEXT,
+            executor_available BOOLEAN NOT NULL DEFAULT FALSE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE TABLE IF NOT EXISTS services(
@@ -81,7 +86,17 @@ async def init_db():
             owner_commission_amount NUMERIC(14,4) NOT NULL,
             executor_commission_amount NUMERIC(14,4) NOT NULL,
             status TEXT NOT NULL DEFAULT 'new',
-            executor_id BIGINT,
+            executor_id BIGINT REFERENCES users(user_id),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            completed_at TIMESTAMPTZ
+        );
+        CREATE TABLE IF NOT EXISTS ratings(
+            id SERIAL PRIMARY KEY,
+            order_id INTEGER NOT NULL REFERENCES orders(id),
+            from_user_id BIGINT NOT NULL REFERENCES users(user_id),
+            to_user_id BIGINT NOT NULL REFERENCES users(user_id),
+            stars INTEGER NOT NULL CHECK (stars >= 1 AND stars <= 5),
+            comment TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         """)
@@ -115,7 +130,7 @@ async def ensure_user(user_id, username):
 async def get_user(user_id):
     async with pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT user_id, username, balance, role FROM users WHERE user_id=$1",
+            "SELECT user_id, username, balance, role, executor_name, executor_description, executor_city, executor_available FROM users WHERE user_id=$1",
             user_id,
         )
 
@@ -179,6 +194,100 @@ async def get_orders(user_id):
                FROM orders o JOIN services s ON s.id = o.service_id
                WHERE o.user_id = $1 ORDER BY o.id DESC LIMIT 20""",
             user_id,
+        )
+
+# ---------- Исполнители ----------
+
+async def register_executor(user_id, name, description, city):
+    """Зарегистрировать пользователя как исполнителя"""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """UPDATE users SET role=$1, executor_name=$2, executor_description=$3, 
+               executor_city=$4, executor_available=$5 
+               WHERE user_id=$6""",
+            "executor", name, description, city, False, user_id
+        )
+
+async def set_executor_available(user_id, available):
+    """Включить/выключить доступность исполнителя"""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET executor_available=$1 WHERE user_id=$2",
+            available, user_id
+        )
+
+async def get_available_executors():
+    """Получить в��ех доступных исполнителей"""
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT user_id, username, executor_name, executor_description, executor_city
+               FROM users WHERE role='executor' AND executor_available=TRUE ORDER BY user_id"""
+        )
+
+async def get_executor_stats(executor_id):
+    """Получить статистику исполнителя: рейтинг, кол-во выполненных"""
+    async with pool.acquire() as conn:
+        completed = await conn.fetchval(
+            "SELECT COUNT(*) FROM orders WHERE executor_id=$1 AND status='done'",
+            executor_id
+        )
+        rating_data = await conn.fetchrow(
+            """SELECT AVG(stars) as avg_rating, COUNT(*) as total_ratings
+               FROM ratings WHERE to_user_id=$1""",
+            executor_id
+        )
+        avg_rating = float(rating_data["avg_rating"]) if rating_data["avg_rating"] else 0
+        total_ratings = rating_data["total_ratings"] or 0
+        
+        return {
+            "completed": completed,
+            "avg_rating": avg_rating,
+            "total_ratings": total_ratings
+        }
+
+async def get_executor_orders(executor_id, status=None):
+    """Получить заявки исполнителя"""
+    async with pool.acquire() as conn:
+        if status:
+            return await conn.fetch(
+                """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.status, 
+                          o.user_id, u.username, o.created_at
+                   FROM orders o 
+                   JOIN services s ON s.id = o.service_id
+                   JOIN users u ON u.user_id = o.user_id
+                   WHERE o.executor_id=$1 AND o.status=$2
+                   ORDER BY o.id DESC LIMIT 20""",
+                executor_id, status
+            )
+        else:
+            return await conn.fetch(
+                """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.status, 
+                          o.user_id, u.username, o.created_at
+                   FROM orders o 
+                   JOIN services s ON s.id = o.service_id
+                   JOIN users u ON u.user_id = o.user_id
+                   WHERE o.executor_id=$1
+                   ORDER BY o.id DESC LIMIT 20""",
+                executor_id
+            )
+
+# ---------- Рейтинги ----------
+
+async def add_rating(order_id, from_user_id, to_user_id, stars, comment=""):
+    """Добавить оценку"""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO ratings(order_id, from_user_id, to_user_id, stars, comment)
+               VALUES($1, $2, $3, $4, $5)""",
+            order_id, from_user_id, to_user_id, stars, comment
+        )
+
+async def has_rating(order_id):
+    """Проверить, есть ли уже оценка для этой заявки"""
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT COUNT(*) FROM ratings WHERE order_id=$1",
+            order_id
         )
 
 # ---------- Админ: услуги ----------
@@ -261,9 +370,14 @@ async def get_order(order_id):
 
 async def set_order_status(order_id, status):
     async with pool.acquire() as conn:
-        await conn.execute(
-            "UPDATE orders SET status=$1 WHERE id=$2", status, order_id
-        )
+        if status == "done":
+            await conn.execute(
+                "UPDATE orders SET status=$1, completed_at=now() WHERE id=$2", status, order_id
+            )
+        else:
+            await conn.execute(
+                "UPDATE orders SET status=$1 WHERE id=$2", status, order_id
+            )
 
 async def assign_executor(order_id, executor_id):
     async with pool.acquire() as conn:
@@ -305,9 +419,13 @@ async def get_stats():
         services_count = await conn.fetchval(
             "SELECT COUNT(*) FROM services WHERE active=TRUE"
         )
+        executors_count = await conn.fetchval(
+            "SELECT COUNT(*) FROM users WHERE role='executor'"
+        )
         return {
             "users": users_count,
             "orders": orders_count,
             "orders_by_status": {row["status"]: row["cnt"] for row in by_status},
             "active_services": services_count,
+            "executors": executors_count,
         }
