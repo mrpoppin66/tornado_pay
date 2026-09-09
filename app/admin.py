@@ -16,6 +16,7 @@ from .db import (
     get_orders_by_status,
     get_service,
     get_stats,
+    get_exchange_rate,
     list_services_admin,
     set_order_status,
     set_service_min_amount,
@@ -113,7 +114,7 @@ async def admin_orders(c: CallbackQuery, state: FSMContext):
     kb = orders_tabs_rows(status)
     for o in rows:
         kb.append([InlineKeyboardButton(
-            text=f"#{o[0]} — {o[3]} — {o[4]:.0f} USDT (итого {o[5]:.0f}) — @{o[2] or o[1]}",
+            text=f"#{o[0]} — {o[3]} — {o[4]:.0f} RUB ({o[5]:.4f} USDT) — @{o[2] or o[1]}",
             callback_data=f"adm:order:{o[0]}",
         )])
     kb.append([InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")])
@@ -125,29 +126,34 @@ async def admin_orders(c: CallbackQuery, state: FSMContext):
 
 
 def render_order_detail(o):
-    owner_comm = float(o[6])
-    executor_comm = float(o[7])
+    owner_comm = float(o[7])
+    executor_comm = float(o[8])
+    user_amount_usdt = float(o[5])
+    executor_gets_usdt = float(o[6])
+    amount_rub = float(o[4])
+    
     text = (
         f"🧾 <b>Заявка #{o[0]}</b>\n\n"
         f"Клиент: @{o[2] or '—'} (<code>{o[1]}</code>)\n"
-        f"Услуга: {o[3]}\n"
-        f"Сумма услуги: {o[4]:.2f} USDT\n"
-        f"Итого к оплате: {o[5]:.2f} USDT\n"
-        f"Комиссия вам: {owner_comm:.2f} USDT\n"
-        f"Комиссия исполнителю: {executor_comm:.2f} USDT\n"
-        f"Статус: {ORDER_STATUS_LABELS.get(o[8], o[8])}\n"
-        f"Исполнитель: {o[9] or '—'}\n"
-        f"Создана: {o[10]:%d.%m.%Y %H:%M}"
+        f"Услуга: {o[3]}\n\n"
+        f"<b>Сумма в рублях:</b> {amount_rub:.2f} RUB\n"
+        f"<b>Сумма в USDT:</b> {user_amount_usdt:.4f} USDT\n\n"
+        f"<b>Разбор:</b>\n"
+        f"Вам (комиссия): {owner_comm:.4f} USDT\n"
+        f"Исполнителю: {executor_gets_usdt:.4f} USDT\n\n"
+        f"Статус: {ORDER_STATUS_LABELS.get(o[9], o[9])}\n"
+        f"Исполнитель: {o[10] or '—'}\n"
+        f"Создана: {o[11]:%d.%m.%Y %H:%M}"
     )
     buttons = []
-    if o[8] == "new":
+    if o[9] == "new":
         buttons.append([InlineKeyboardButton(text="🔧 Взять в работу", callback_data=f"adm:ordstatus:{o[0]}:in_progress")])
-    if o[8] == "in_progress":
+    if o[9] == "in_progress":
         buttons.append([InlineKeyboardButton(text="✅ Отметить выполненной", callback_data=f"adm:ordstatus:{o[0]}:done")])
-    if o[8] in ("new", "in_progress"):
+    if o[9] in ("new", "in_progress"):
         buttons.append([InlineKeyboardButton(text="❌ Отменить", callback_data=f"adm:ordstatus:{o[0]}:cancelled")])
         buttons.append([InlineKeyboardButton(text="👷 Назначить исполнителя", callback_data=f"adm:ordexec:{o[0]}")])
-    buttons.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"adm:orders:{o[8]}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"adm:orders:{o[9]}")])
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -203,13 +209,15 @@ async def admin_order_exec_finish(m: Message, state: FSMContext):
 
 def services_list_kb(rows):
     kb = []
+    rate = get_exchange_rate()
     for s in rows:
         mark = "✅" if s[6] else "🚫"
         owner_c = float(s[4])
         executor_c = float(s[5])
         total_c = owner_c + executor_c
+        min_rub = float(s[3]) * rate
         kb.append([InlineKeyboardButton(
-            text=f"{mark} {s[1]} | мин {s[3]:.2f} | комиссия {total_c:.1f}%",
+            text=f"{mark} {s[1]} | мин {s[3]:.2f} USDT (~{min_rub:.0f} RUB) | комиссия {total_c:.1f}%",
             callback_data=f"adm:svc:{s[0]}"
         )])
     kb.append([InlineKeyboardButton(text="➕ Добавить услугу", callback_data="adm:svcadd")])
@@ -228,18 +236,21 @@ async def admin_services(c: CallbackQuery, state: FSMContext):
 
 
 def render_service_detail(s):
+    rate = get_exchange_rate()
     status = "активна" if s[6] else "отключена"
     owner_c = float(s[4])
     executor_c = float(s[5])
     total_c = owner_c + executor_c
+    min_rub = float(s[3]) * rate
     text = (
         f"🛒 <b>{s[1]}</b>\n\n"
         f"{s[2] or '—'}\n\n"
-        f"Минимальная сумма: {s[3]:.2f} USDT\n"
+        f"Минимальная сумма: {s[3]:.2f} USDT (~{min_rub:.0f} RUB)\n"
         f"Комиссия вам: {owner_c:.2f}%\n"
         f"Комиссия исполнителю: {executor_c:.2f}%\n"
         f"Итого комиссия: {total_c:.2f}%\n"
-        f"Статус: {status}"
+        f"Статус: {status}\n\n"
+        f"Текущий курс: 1 USDT = {rate:.2f} RUB"
     )
     toggle_text = "🚫 Деактивировать" if s[6] else "✅ Активировать"
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -282,8 +293,10 @@ async def admin_service_min_start(c: CallbackQuery, state: FSMContext):
     sid = int(c.data.split(":")[2])
     await state.update_data(service_id=sid)
     await state.set_state(AdminStates.waiting_new_min_amount)
+    rate = get_exchange_rate()
     await c.message.edit_text(
-        "📏 Пришлите новую минимальную сумму числом (например 10 или 5.50).",
+        f"📏 Пришлите новую минимальную сумму в USDT (например 10 или 5.50).\n"
+        f"Текущий курс: 1 USDT = {rate:.2f} RUB",
         reply_markup=admin_back_kb(), parse_mode="HTML")
     await c.answer()
 
@@ -385,7 +398,8 @@ async def admin_service_add_description(m: Message, state: FSMContext):
     desc = "" if raw == "-" else raw
     await state.update_data(description=desc)
     await state.set_state(AdminStates.waiting_service_min_amount)
-    await m.answer("Теперь пришлите минимальную сумму заявки (например 10).")
+    rate = get_exchange_rate()
+    await m.answer(f"Теперь пришлите минимальную сумму в USDT (например 10).\nТекущий курс: 1 USDT = {rate:.2f} RUB")
 
 
 @admin_router.message(AdminStates.waiting_service_min_amount)
@@ -491,6 +505,7 @@ async def admin_balance_finish(m: Message, state: FSMContext):
 async def admin_stats(c: CallbackQuery, state: FSMContext):
     await state.clear()
     s = await get_stats()
+    rate = get_exchange_rate()
     by_status = s["orders_by_status"]
     lines = [f"{ORDER_STATUS_LABELS.get(k, k)}: {v}" for k, v in by_status.items()]
     text = (
@@ -498,6 +513,7 @@ async def admin_stats(c: CallbackQuery, state: FSMContext):
         f"Пользователей: {s['users']}\n"
         f"Активных услуг: {s['active_services']}\n"
         f"Заявок всего: {s['orders']}\n\n"
+        f"Текущий курс: 1 USDT = {rate:.2f} RUB\n\n"
         + ("\n".join(lines) if lines else "Заявок пока нет.")
     )
     await c.message.edit_text(text, reply_markup=admin_back_kb(), parse_mode="HTML")
