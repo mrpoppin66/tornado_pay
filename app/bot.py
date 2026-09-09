@@ -3,7 +3,7 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from dotenv import load_dotenv
-from .db import init_db, ensure_user, get_user, get_services, create_order, get_orders
+from .db import init_db, close_db, ensure_user, get_user, get_services, create_order, get_orders
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -112,4 +112,7 @@ async def go_back(c: CallbackQuery):
 async def main():
     await init_db()
     bot = Bot(TOKEN)
-    await dp.start_polling(bot)
+    try:
+        await dp.start_polling(bot)
+    finally:
+        await close_db()
