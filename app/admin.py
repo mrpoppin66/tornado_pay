@@ -130,7 +130,17 @@ async def admin_entry(m: Message, state: FSMContext):
 @admin_router.callback_query(F.data == "adm:menu")
 async def admin_menu_cb(c: CallbackQuery, state: FSMContext):
     await state.clear()
-    await c.message.edit_text("🛠 <b>Админ-панель</b>", reply_markup=admin_menu_kb(), parse_mode="HTML")
+    text, kb = "🛠 <b>Админ-панель</b>", admin_menu_kb()
+    if c.message.photo:
+        # Сюда можно попасть прямо с фото-меню после /start — фото-сообщение
+        # нельзя отредактировать как текстовое, поэтому отправляем новое.
+        try:
+            await c.message.delete()
+        except Exception:
+            pass
+        await c.message.answer(text, reply_markup=kb, parse_mode="HTML")
+    else:
+        await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await c.answer()
 
 

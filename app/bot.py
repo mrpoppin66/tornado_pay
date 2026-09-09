@@ -62,6 +62,20 @@ def back():
         [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back")]
     ])
 
+async def safe_edit(c: CallbackQuery, text, reply_markup=None, parse_mode="HTML"):
+    """Заменяет текущий экран новым текстом. Первое меню после /start —
+    это фото с подписью, а фото-сообщение нельзя отредактировать как
+    текстовое (Telegram это не поддерживает). В этом случае старое
+    сообщение удаляется и текст отправляется новым сообщением."""
+    if c.message.photo:
+        try:
+            await c.message.delete()
+        except Exception:
+            pass
+        await c.message.answer(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    else:
+        await c.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+
 def chat_kb(order_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Закрыть чат", callback_data=f"chat:close:{order_id}")]
@@ -128,16 +142,18 @@ async def start(m: Message):
     await ensure_user(m.from_user.id, m.from_user.username)
     user = await get_user(m.from_user.id)
     rate = get_exchange_rate()
-    try:
-        await m.answer_photo(FSInputFile(START_BANNER_PATH))
-    except Exception as e:
-        print(f"[start banner] {e}")
-    await m.answer(
+    caption = (
         f"👋 Добро пожаловать в <b>TornadoPay</b>!\n\n"
         f"Маркетплейс услуг с оплатой в криптовалюте.\n"
         f"Выберите услугу и укажите сумму в рублях.\n\n"
-        f"📊 Текущий курс: 1 USDT = {rate:.2f} RUB",
-        reply_markup=menu(m.from_user.id, user[3] if user else None), parse_mode="HTML")
+        f"📊 Текущий курс: 1 USDT = {rate:.2f} RUB"
+    )
+    kb = menu(m.from_user.id, user[3] if user else None)
+    try:
+        await m.answer_photo(FSInputFile(START_BANNER_PATH), caption=caption, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        print(f"[start banner] {e}")
+        await m.answer(caption, reply_markup=kb, parse_mode="HTML")
 
 @dp.callback_query(F.data == "balance")
 async def balance(c: CallbackQuery):
@@ -203,9 +219,9 @@ async def services(c: CallbackQuery):
 
     kb = [[InlineKeyboardButton(text=text, callback_data=f"svc:{rows[i][0]}")] for i, text in enumerate(min_rub_text)]
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
-    await c.message.edit_text(
+    await safe_edit(c,
         "🛒 <b>Услуги</b>\n\nВыберите услугу:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await c.answer()
 
 @dp.callback_query(F.data.startswith("svc:"))
@@ -395,12 +411,12 @@ async def executor(c: CallbackQuery, state: FSMContext):
     app=await get_latest_executor_application(c.from_user.id)
     if u and u[3]=="executor":
         if u[8]:
-            await c.message.edit_text("🚫 <b>Доступ исполнителя заблокирован администрацией.</b>\n\nОбратитесь в поддержку.",reply_markup=back(),parse_mode="HTML")
+            await safe_edit(c, "🚫 <b>Доступ исполнителя заблокирован администрацией.</b>\n\nОбратитесь в поддержку.",reply_markup=back())
         else:
             stats=await get_executor_detailed_stats(c.from_user.id)
             active=await get_executor_active_order(c.from_user.id)
             status="🟢 Доступен" if u[7] else "🔴 Не доступен"
-            await c.message.edit_text(
+            await safe_edit(c,
                 f"🧑‍💼 <b>ЛК Исполнителя</b>\n\n"
                 f"Статус: {status}\n"
                 f"💰 Баланс: <b>{float(u[2]):.4f} USDT</b>\n\n"
@@ -408,7 +424,7 @@ async def executor(c: CallbackQuery, state: FSMContext):
                 f"❌ Отменено: <b>{stats['cancelled']}</b>\n"
                 f"⚖️ Споров: <b>{stats['disputes']}</b>\n"
                 f"⭐ Рейтинг: <b>{stats['rating']:.2f}</b> ({stats['ratings']})",
-                reply_markup=executor_cabinet_kb(bool(u[7]),bool(active)),parse_mode="HTML")
+                reply_markup=executor_cabinet_kb(bool(u[7]),bool(active)))
     elif app and app[5] in ("pending","question"):
         label=EXECUTOR_APPLICATION_STATUSES[app[5]]
         text=f"🧑‍💼 <b>Заявка исполнителя</b>\n\nСтатус: <b>{label}</b>"
@@ -418,12 +434,12 @@ async def executor(c: CallbackQuery, state: FSMContext):
         else:
             text += "\n\nМы уведомим вас после принятия решения."
             kb=back()
-        await c.message.edit_text(text,reply_markup=kb,parse_mode="HTML")
+        await safe_edit(c, text,reply_markup=kb)
     elif app and app[5]=="rejected":
         reason=app[8] or "не указана"
-        await c.message.edit_text(f"❌ <b>Ваша заявка отклонена.</b>\n\nПричина: {escape(reason)}",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Подать новую заявку",callback_data="exec:apply")],[InlineKeyboardButton(text="⬅️ Главное меню",callback_data="back")]]),parse_mode="HTML")
+        await safe_edit(c, f"❌ <b>Ваша заявка отклонена.</b>\n\nПричина: {escape(reason)}",reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Подать новую заявку",callback_data="exec:apply")],[InlineKeyboardButton(text="⬅️ Главное меню",callback_data="back")]]))
     else:
-        await c.message.edit_text("🧑‍💼 <b>Стать исполнителем</b>\n\nДля получения доступа к заявкам необходимо подать заявку.\n\nПосле заполнения она будет рассмотрена администрацией Tornado Pay.",reply_markup=executor_application_kb(),parse_mode="HTML")
+        await safe_edit(c, "🧑‍💼 <b>Стать исполнителем</b>\n\nДля получения доступа к заявкам необходимо подать заявку.\n\nПосле заполнения она будет рассмотрена администрацией Tornado Pay.",reply_markup=executor_application_kb())
     await c.answer()
 
 @dp.callback_query(F.data == "exec:apply")
@@ -760,14 +776,14 @@ async def notifications(c: CallbackQuery):
             if x[1]:
                 kb.append([InlineKeyboardButton(text=f"📋 Заявка #{x[1]}", callback_data=f"order:view:{x[1]}")])
     kb.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back")])
-    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+    await safe_edit(c, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
     await c.answer()
 
 @dp.callback_query(F.data == "support")
 async def support(c: CallbackQuery):
-    await c.message.edit_text(
+    await safe_edit(c,
         "🆘 <b>Поддержка</b>\n\nСвязь с поддержкой будет добавлена следующим этапом.",
-        reply_markup=back(), parse_mode="HTML")
+        reply_markup=back())
     await c.answer()
 
 @dp.callback_query(F.data == "back")
