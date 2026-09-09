@@ -1,11 +1,11 @@
 import os
 from html import escape
 
-from aiogram import Router, F
+from aiogram import Bot, Router, F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message, Bot
+from aiogram.types import CallbackQuery, InlineKeyboardButton, InlineKeyboardMarkup, Message
 
 from .db import (
     ORDER_STATUS_LABELS,
