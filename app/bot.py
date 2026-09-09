@@ -7,7 +7,7 @@ from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKe
 from dotenv import load_dotenv
 from .db import (
     init_db, close_db, ensure_user, get_user, get_services, get_service, create_order, 
-    get_orders, ORDER_STATUS_LABELS,
+    get_orders, ORDER_STATUS_LABELS, get_exchange_rate, start_exchange_rate_updater,
 )
 from .admin import admin_router, ADMIN_IDS
 
@@ -43,10 +43,12 @@ def back():
 @dp.message(CommandStart())
 async def start(m: Message):
     await ensure_user(m.from_user.id, m.from_user.username)
+    rate = get_exchange_rate()
     await m.answer(
-        "👋 Добро пожаловать в <b>TornadoPay</b>!\n\n"
-        "Маркетплейс услуг с оплатой в криптовалюте.\n"
-        "Выберите услугу и укажите сумму — мы рассчитаем комиссию.",
+        f"👋 Добро пожаловать в <b>TornadoPay</b>!\n\n"
+        f"Маркетплейс услуг с оплатой в криптовалюте.\n"
+        f"Выберите услугу и укажите сумму в рублях.\n\n"
+        f"📊 Текущий курс: 1 USDT = {rate:.2f} RUB",
         reply_markup=menu(m.from_user.id), parse_mode="HTML")
 
 @dp.callback_query(F.data == "balance")
@@ -70,7 +72,13 @@ async def profile(c: CallbackQuery):
 @dp.callback_query(F.data == "services")
 async def services(c: CallbackQuery):
     rows = await get_services()
-    kb = [[InlineKeyboardButton(text=f"{x[1]} (мин. {x[3]:.2f} USDT)", callback_data=f"svc:{x[0]}")] for x in rows]
+    rate = get_exchange_rate()
+    min_rub_text = []
+    for x in rows:
+        min_rub = float(x[3]) * rate
+        min_rub_text.append(f"{x[1]} (мин. {x[3]:.2f} USDT / ~{min_rub:.0f} RUB)")
+    
+    kb = [[InlineKeyboardButton(text=text, callback_data=f"svc:{rows[i][0]}")] for i, text in enumerate(min_rub_text)]
     kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="back")])
     await c.message.edit_text(
         "🛒 <b>Услуги</b>\n\nВыберите услугу:",
@@ -85,19 +93,24 @@ async def service_select(c: CallbackQuery, state: FSMContext):
         await c.answer("Услуга не найдена", show_alert=True)
         return
     
+    rate = get_exchange_rate()
     await state.update_data(service_id=sid, service_name=service[1], 
-                           min_amount=float(service[3]), 
+                           min_amount_usdt=float(service[3]), 
                            owner_comm=float(service[4]),
-                           executor_comm=float(service[5]))
+                           executor_comm=float(service[5]),
+                           exchange_rate=rate)
     await state.set_state(UserStates.waiting_order_amount)
     
     total_comm = float(service[4]) + float(service[5])
+    min_rub = float(service[3]) * rate
+    
     await c.message.edit_text(
         f"🛒 <b>{service[1]}</b>\n\n"
         f"{service[2]}\n\n"
-        f"Минимальная сумма: {service[3]:.2f} USDT\n"
-        f"Комиссия: {total_comm:.1f}%\n\n"
-        f"Пришлите сумму (числом, например 100 или 50.50):",
+        f"Минимальная сумма: {service[3]:.2f} USDT (~{min_rub:.0f} RUB)\n"
+        f"Комиссия: {total_comm:.1f}%\n"
+        f"Текущий курс: 1 USDT = {rate:.2f} RUB\n\n"
+        f"Пришлите сумму в <b>рублях</b> (например 300 или 150.50):",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⬅️ К услугам", callback_data="services")]
         ]), parse_mode="HTML")
@@ -110,20 +123,22 @@ async def order_amount(m: Message, state: FSMContext):
         return
     
     try:
-        amount = float(m.text.strip().replace(",", "."))
+        amount_rub = float(m.text.strip().replace(",", "."))
     except ValueError:
-        await m.answer("Неверный формат. Пришлите сумму числом (например 100 или 50.50).")
+        await m.answer("Неверный формат. Пришлите сумму числом (например 300 или 150.50).")
         return
     
     data = await state.get_data()
-    min_amount = float(data["min_amount"])
+    rate = data["exchange_rate"]
+    min_amount_usdt = float(data["min_amount_usdt"])
+    min_rub = min_amount_usdt * rate
     
-    if amount < min_amount:
-        await m.answer(f"❌ Минимальная сумма для этой услуги: {min_amount:.2f} USDT")
+    if amount_rub < min_rub:
+        await m.answer(f"❌ Минимальная сумма: {min_rub:.2f} RUB ({min_amount_usdt:.2f} USDT)")
         return
     
     # Создаём заявку
-    oid = await create_order(m.from_user.id, data["service_id"], amount)
+    oid = await create_order(m.from_user.id, data["service_id"], amount_rub)
     if not oid:
         await m.answer("❌ Ошибка при создании заявки. Попробуйте ещё раз.")
         await state.clear()
@@ -132,18 +147,26 @@ async def order_amount(m: Message, state: FSMContext):
     owner_comm = float(data["owner_comm"])
     executor_comm = float(data["executor_comm"])
     total_comm = owner_comm + executor_comm
-    commission = amount * (total_comm / 100)
-    total_amount = amount + commission
+    
+    # Конвертируем в USDT
+    user_amount_usdt = amount_rub / rate
+    commission_usdt = user_amount_usdt * (total_comm / 100)
+    total_amount_usdt = user_amount_usdt + commission_usdt
+    executor_amount_usdt = user_amount_usdt + (user_amount_usdt * (executor_comm / 100))
     
     await state.clear()
     await m.answer(
         f"🧾 <b>Заявка #{oid}</b>\n\n"
         f"Услуга: {data['service_name']}\n"
-        f"Сумма услуги: {amount:.2f} USDT\n"
-        f"Комиссия ({total_comm:.1f}%): {commission:.2f} USDT\n"
-        f"<b>Всего к оплате: {total_amount:.2f} USDT</b>\n\n"
-        f"Исполнитель получит: {amount + amount * (executor_comm / 100):.2f} USDT\n\n"
-        f"Заявка создана. Ожидание исполнителя...",
+        f"Сумма в рублях: {amount_rub:.2f} RUB\n\n"
+        f"<b>Для пользователя:</b>\n"
+        f"К оплате: {user_amount_usdt:.4f} USDT\n"
+        f"Комиссия: {commission_usdt:.4f} USDT\n"
+        f"<b>Всего: {total_amount_usdt:.4f} USDT</b>\n\n"
+        f"<b>Для исполнителя:</b>\n"
+        f"К выполнению: {amount_rub:.2f} RUB\n"
+        f"Получит: {executor_amount_usdt:.4f} USDT\n\n"
+        f"Курс фиксирован. Ожидание исполнителя...",
         reply_markup=back(), parse_mode="HTML")
 
 @dp.callback_query(F.data == "orders")
@@ -153,9 +176,10 @@ async def orders(c: CallbackQuery):
     if not rows:
         text += "Заявок пока нет."
     else:
-        text += "\n".join(
-            f"#{x[0]} — {x[1]}\nСумма: {x[2]:.2f} USDT | Итого: {x[3]:.2f} USDT\nСтатус: {ORDER_STATUS_LABELS.get(x[4], x[4])}\n"
-            for x in rows)
+        for x in rows:
+            text += (f"#{x[0]} — {x[1]}\n"
+                    f"Сумма: {x[2]:.2f} RUB → {x[3]:.4f} USDT\n"
+                    f"Итого: {x[4]:.4f} USDT | {ORDER_STATUS_LABELS.get(x[5], x[5])}\n\n")
     await c.message.edit_text(text, reply_markup=back(), parse_mode="HTML")
     await c.answer()
 
@@ -176,13 +200,21 @@ async def support(c: CallbackQuery):
 @dp.callback_query(F.data == "back")
 async def go_back(c: CallbackQuery, state: FSMContext):
     await state.clear()
+    rate = get_exchange_rate()
     await c.message.edit_text(
-        "🏠 <b>TornadoPay</b>\n\nВыберите раздел:",
+        f"🏠 <b>TornadoPay</b>\n\n"
+        f"Выберите раздел:\n\n"
+        f"📊 Курс: 1 USDT = {rate:.2f} RUB",
         reply_markup=menu(c.from_user.id), parse_mode="HTML")
     await c.answer()
 
 async def main():
     await init_db()
+    
+    # Запускаем фоновое обновление курса
+    import asyncio
+    asyncio.create_task(start_exchange_rate_updater())
+    
     bot = Bot(TOKEN)
     try:
         await dp.start_polling(bot)
