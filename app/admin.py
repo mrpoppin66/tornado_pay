@@ -27,7 +27,9 @@ from .db import (
     list_executor_applications, get_executor_application, set_executor_application_question,
     approve_executor_application, reject_executor_application, block_executor, unblock_executor,
     EXECUTOR_APPLICATION_STATUSES,
-    settle_order_executor, refund_order_client,
+    settle_order_executor, refund_order_client, get_pending_withdrawals, approve_withdrawal, reject_withdrawal, get_disputed_orders, get_recent_chat_messages,
+    get_order_events, get_order_evidence, list_executors_admin, set_user_blocked_only, get_all_services_stats, set_service_max_amount, get_service_limits, get_user_blocked, get_user_block_info,
+    log_order_event, create_notification,
 )
 
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_ID", "").split(",") if x.strip().isdigit()}
@@ -41,9 +43,11 @@ class AdminStates(StatesGroup):
     waiting_service_name = State()
     waiting_service_description = State()
     waiting_service_min_amount = State()
+    waiting_service_max_amount = State()
     waiting_service_owner_commission = State()
     waiting_service_executor_commission = State()
     waiting_new_min_amount = State()
+    waiting_new_max_amount = State()
     waiting_new_owner_commission = State()
     waiting_new_executor_commission = State()
     waiting_executor_id = State()
@@ -51,6 +55,7 @@ class AdminStates(StatesGroup):
     waiting_balance_amount = State()
     waiting_executor_question = State()
     waiting_executor_rejection = State()
+    waiting_block_reason = State()
 
 
 def parse_positive_number(text):
@@ -67,10 +72,12 @@ def parse_positive_number(text):
 def admin_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Заявки", callback_data="adm:orders:new")],
-        [InlineKeyboardButton(text="🧑‍💼 Исполнители", callback_data="adm:exec")],
+        [InlineKeyboardButton(text="⚖️ Споры", callback_data="adm:disputes")],
+        [InlineKeyboardButton(text="🧑‍💼 Исполнители", callback_data="adm:executors")],
         [InlineKeyboardButton(text="🛒 Услуги", callback_data="adm:services")],
         [InlineKeyboardButton(text="👤 Пользователь", callback_data="adm:user")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
+        [InlineKeyboardButton(text="💸 Выводы", callback_data="adm:withdrawals")],
     ])
 
 
@@ -190,6 +197,7 @@ async def admin_order_detail(c: CallbackQuery, state: FSMContext):
 async def admin_order_status(c: CallbackQuery):
     _, _, order_id, new_status = c.data.split(":")
     await set_order_status(int(order_id), new_status)
+    await log_order_event(int(order_id), c.from_user.id, "status_changed", f"Администратор изменил статус на {new_status}")
     o = await get_order(int(order_id))
     text, kb = render_order_detail(o)
     await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
@@ -245,476 +253,72 @@ async def admin_settle(c: CallbackQuery):
         from .db import dispute_order_by_admin
         result = await dispute_order_by_admin(order_id)
         msg = "Заявка переведена в спор." if result else "Не удалось открыть спор."
+    if result:
+        await log_order_event(order_id, c.from_user.id, "admin_decision", msg)
+        try:
+            if action == "executor" and isinstance(result, tuple):
+                await create_notification(result[0], "order", f"⚖️ Заявка #{order_id} закрыта", "Решение администрации: в пользу исполнителя.", order_id)
+            elif action == "client" and isinstance(result, tuple):
+                await create_notification(result[0], "order", f"⚖️ Заявка #{order_id} закрыта", "Решение администрации: в пользу клиента.", order_id)
+        except Exception as e: print(f"[Decision notify] {e}")
     await c.answer(msg, show_alert=True)
     o = await get_order(order_id)
     if o:
         text, kb = render_order_detail(o)
         await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
 
-# ---------- Заявки исполнителей ----------
+# ---------- Управление исполнителями ----------
 
-async def notify_new_executor_application(application_id, bot: Bot):
-    app = await get_executor_application(application_id)
-    if not app:
+@admin_router.callback_query(F.data == "adm:executors")
+async def admin_executors(c: CallbackQuery):
+    rows=await list_executors_admin(50)
+    kb=[]
+    for r in rows:
+        status="🚫" if r[4] else ("🟢" if r[3] else "🔴")
+        kb.append([InlineKeyboardButton(text=f"{status} {r[2] or r[0]} · ⭐ {float(r[7]):.2f} · ✅ {r[6]}", callback_data=f"adm:executorview:{r[0]}")])
+    kb.append([InlineKeyboardButton(text="⬅️ Админ-меню",callback_data="adm:menu")])
+    await c.message.edit_text("🧑‍💼 <b>Исполнители</b>\n\nВыберите исполнителя:",reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),parse_mode="HTML"); await c.answer()
+
+@admin_router.callback_query(F.data.startswith("adm:executorview:"))
+async def admin_executor_view(c: CallbackQuery):
+    uid=int(c.data.split(":")[2]); r=next((x for x in await list_executors_admin(100) if x[0]==uid),None)
+    if not r:
+        await c.answer("Исполнитель не найден",show_alert=True); return
+    blocked=bool(r[4])
+    text=(f"🧑‍💼 <b>Исполнитель</b>\n\nID: <code>{r[0]}</code>\n"
+          f"Имя: {escape(r[2] or '—')}\n"
+          f"Username: @{r[1] or '—'}\n"
+          f"Статус: {'🚫 Заблокирован' if blocked else ('🟢 Доступен' if r[3] else '🔴 Не доступен')}\n"
+          f"⭐ Рейтинг: <b>{float(r[7]):.2f}</b> ({r[8]})\n"
+          f"✅ Выполнено: <b>{r[6]}</b>\n"
+          f"💰 Баланс: <b>{float(r[5]):.4f} USDT</b>")
+    kb=[[InlineKeyboardButton(text=("🔓 Разблокировать" if blocked else "🚫 Заблокировать"),callback_data=f"adm:userblock:{uid}:{0 if blocked else 1}")], [InlineKeyboardButton(text="⬅️ Исполнители",callback_data="adm:executors")]]
+    await c.message.edit_text(text,reply_markup=InlineKeyboardMarkup(inline_keyboard=kb),parse_mode="HTML"); await c.answer()
+
+@admin_router.callback_query(F.data.startswith("adm:userblock:"))
+async def admin_user_block_start(c: CallbackQuery, state: FSMContext):
+    _,_,uid,action=c.data.split(":"); uid=int(uid)
+    if action == "0":
+        await set_user_blocked_only(uid, False)
+        await c.answer("Пользователь разблокирован.")
+        u=await find_user(str(uid))
+        if u:
+            await c.message.edit_text(f"👤 <b>Пользователь</b>\n\nID: <code>{u[0]}</code>\nUsername: @{u[1] or '—'}\nБаланс: {float(u[2]):.4f} USDT\nРоль: {u[3]}\nСтатус: 🟢 Активен", reply_markup=user_profile_kb(u[0],u[3]=='executor',False),parse_mode="HTML")
         return
-    text, kb = render_executor_application(app)
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
-        except Exception as e:
-            print(f"[Admin notify] {admin_id}: {e}")
-
-
-async def notify_executor_application_answer(application_id, bot: Bot):
-    app = await get_executor_application(application_id)
-    if not app:
-        return
-    text, kb = render_executor_application(app)
-    for admin_id in ADMIN_IDS:
-        try:
-            await bot.send_message(admin_id, "💬 <b>Исполнитель ответил на вопрос</b>\n\n" + text, reply_markup=kb, parse_mode="HTML")
-        except Exception as e:
-            print(f"[Admin notify] {admin_id}: {e}")
-
-
-def executor_apps_menu_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⏳ На рассмотрении", callback_data="adm:execapps:pending")],
-        [InlineKeyboardButton(text="💬 Ожидают ответа", callback_data="adm:execapps:question")],
-        [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")],
-    ])
-
-
-def render_executor_application(a):
-    # a: id, user_id, username, executor_name, experience, services, comment, status, question, answer, reason, created_at, updated_at
-    text = (
-        f"🧑‍💼 <b>Новая заявка исполнителя</b>\n\n"
-        f"ID заявки: <code>{a[0]}</code>\n"
-        f"Пользователь: <code>{a[1]}</code> (@{a[2] or '—'})\n"
-        f"📅 Дата подачи: {a[11]:%d.%m.%Y %H:%M}\n\n"
-        f"📝 <b>Информация:</b>\n"
-        f"<b>Опыт:</b> {escape(a[4])}\n\n"
-        f"<b>Услуги:</b> {escape(a[5])}\n\n"
-        f"<b>Комментарий:</b> {escape(a[6]) or '—'}\n\n"
-        f"Статус: <b>{EXECUTOR_APPLICATION_STATUSES.get(a[7], a[7])}</b>"
-    )
-    if a[8]:
-        text += f"\n\n💬 <b>Вопрос администрации:</b>\n{escape(a[8])}"
-    if a[9]:
-        text += f"\n\n↩️ <b>Ответ исполнителя:</b>\n{escape(a[9])}"
-    if a[10]:
-        text += f"\n\n❌ <b>Причина отказа:</b>\n{escape(a[10])}"
-
-    buttons = []
-    if a[7] in ("pending", "question"):
-        buttons.append([InlineKeyboardButton(text="✅ Одобрить", callback_data=f"adm:execapprove:{a[0]}"),
-                        InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm:execreject:{a[0]}")])
-        buttons.append([InlineKeyboardButton(text="💬 Задать вопрос", callback_data=f"adm:execquestion:{a[0]}")])
-    buttons.append([InlineKeyboardButton(text="⬅️ К заявкам", callback_data="adm:execapps:pending")])
-    return text, InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
-@admin_router.callback_query(F.data == "adm:exec")
-async def admin_executor_apps(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    await c.message.edit_text("🧑‍💼 <b>Заявки исполнителей</b>", reply_markup=executor_apps_menu_kb(), parse_mode="HTML")
+    await state.update_data(target_user_id=uid)
+    await state.set_state(AdminStates.waiting_block_reason)
+    await c.message.edit_text("🚫 <b>Блокировка пользователя</b>\n\nУкажите причину блокировки или отправьте «-», чтобы оставить причину пустой.",reply_markup=admin_back_kb(),parse_mode="HTML")
     await c.answer()
 
-
-@admin_router.callback_query(F.data.startswith("adm:execapps:"))
-async def admin_executor_apps_list(c: CallbackQuery, state: FSMContext):
+@admin_router.message(AdminStates.waiting_block_reason)
+async def admin_user_block_finish(m: Message, state: FSMContext):
+    data=await state.get_data(); uid=int(data["target_user_id"]); raw=(m.text or '').strip(); reason='' if raw=='-' else raw
+    await set_user_blocked_only(uid, True, reason)
     await state.clear()
-    status = c.data.split(":")[2]
-    rows = await list_executor_applications(status)
-    kb = []
-    for a in rows:
-        kb.append([InlineKeyboardButton(text=f"#{a[0]} — @{a[2] or a[1]} — {EXECUTOR_APPLICATION_STATUSES.get(a[3], a[3])}", callback_data=f"adm:execapp:{a[0]}")])
-    kb.append([InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:exec")])
-    await c.message.edit_text("🧑‍💼 <b>Заявки исполнителей</b>\n\n" + ("Заявок нет." if not rows else "Выберите заявку:"), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
-    await c.answer()
-
-
-@admin_router.callback_query(F.data.startswith("adm:execapp:"))
-async def admin_executor_app_detail(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    app = await get_executor_application(int(c.data.split(":")[2]))
-    if not app:
-        await c.answer("Заявка не найдена", show_alert=True)
-        return
-    text, kb = render_executor_application(app)
-    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    await c.answer()
-
-
-@admin_router.callback_query(F.data.startswith("adm:execapprove:"))
-async def admin_executor_approve(c: CallbackQuery):
-    app_id = int(c.data.split(":")[2])
-    user_id = await approve_executor_application(app_id)
-    if not user_id:
-        await c.answer("Заявка уже обработана.", show_alert=True)
-        return
+    await m.answer("🚫 Пользователь заблокирован.",reply_markup=admin_back_kb())
     try:
-        await c.bot.send_message(user_id, "🎉 <b>Ваша заявка одобрена!</b>\n\nТеперь вы зарегистрированы как исполнитель Tornado Pay.\n\nЧтобы начать работу, откройте кабинет исполнителя и включите доступность.", parse_mode="HTML")
-    except Exception as e:
-        print(f"[Executor approve notify] {e}")
-    app = await get_executor_application(app_id)
-    text, kb = render_executor_application(app)
-    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    await c.answer("Исполнитель одобрен")
-
-
-@admin_router.callback_query(F.data.startswith("adm:execreject:"))
-async def admin_executor_reject_start(c: CallbackQuery, state: FSMContext):
-    app_id = int(c.data.split(":")[2])
-    await state.update_data(application_id=app_id)
-    await state.set_state(AdminStates.waiting_executor_rejection)
-    await c.message.edit_text("❌ <b>Отклонение заявки</b>\n\nПришлите причину отказа или отправьте «-», если причина не указывается.", reply_markup=admin_back_kb(), parse_mode="HTML")
-    await c.answer()
-
-
-@admin_router.message(AdminStates.waiting_executor_rejection)
-async def admin_executor_reject_finish(m: Message, state: FSMContext):
-    data = await state.get_data()
-    reason = (m.text or "").strip()
-    if not reason:
-        await m.answer("Отправьте причину или «-».")
-        return
-    reason = "" if reason == "-" else reason
-    user_id = await reject_executor_application(data["application_id"], reason)
-    await state.clear()
-    if not user_id:
-        await m.answer("Заявка уже обработана.", reply_markup=admin_back_kb())
-        return
-    try:
-        text = "❌ <b>Ваша заявка отклонена.</b>"
-        if reason:
-            text += f"\n\nПричина:\n{escape(reason)}"
-        await m.bot.send_message(user_id, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="📝 Подать новую заявку", callback_data="exec:apply")]]), parse_mode="HTML")
-    except Exception as e:
-        print(f"[Executor reject notify] {e}")
-    await m.answer("❌ Заявка отклонена.", reply_markup=admin_back_kb())
-
-
-@admin_router.callback_query(F.data.startswith("adm:execquestion:"))
-async def admin_executor_question_start(c: CallbackQuery, state: FSMContext):
-    app_id = int(c.data.split(":")[2])
-    await state.update_data(application_id=app_id)
-    await state.set_state(AdminStates.waiting_executor_question)
-    await c.message.edit_text("💬 <b>Вопрос исполнителю</b>\n\nНапишите вопрос одним сообщением.", reply_markup=admin_back_kb(), parse_mode="HTML")
-    await c.answer()
-
-
-@admin_router.message(AdminStates.waiting_executor_question)
-async def admin_executor_question_finish(m: Message, state: FSMContext):
-    if not m.text or not m.text.strip():
-        await m.answer("Вопрос не может быть пустым.")
-        return
-    data = await state.get_data()
-    app_id = data["application_id"]
-    app = await get_executor_application(app_id)
-    if not app or app[7] not in ("pending", "question"):
-        await state.clear()
-        await m.answer("Заявка уже обработана.")
-        return
-    await set_executor_application_question(app_id, m.text.strip())
-    await state.clear()
-    try:
-        await m.bot.send_message(app[1], "💬 <b>Администрация Tornado Pay задала вопрос по вашей заявке:</b>\n\n" + escape(m.text.strip()), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Ответить", callback_data=f"exec:answer:{app_id}")]]), parse_mode="HTML")
-    except Exception as e:
-        print(f"[Executor question notify] {e}")
-    await m.answer("💬 Вопрос отправлен исполнителю.", reply_markup=admin_back_kb())
-
-
-# ---------- Услуги ----------
-
-def services_list_kb(rows):
-    kb = []
-    rate = get_exchange_rate()
-    for s in rows:
-        mark = "✅" if s[6] else "🚫"
-        owner_c = float(s[4])
-        executor_c = float(s[5])
-        total_c = owner_c + executor_c
-        min_rub = float(s[3]) * rate
-        kb.append([InlineKeyboardButton(
-            text=f"{mark} {s[1]} | мин {s[3]:.2f} USDT (~{min_rub:.0f} RUB) | комиссия {total_c:.1f}%",
-            callback_data=f"adm:svc:{s[0]}"
-        )])
-    kb.append([InlineKeyboardButton(text="➕ Добавить услугу", callback_data="adm:svcadd")])
-    kb.append([InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
-
-
-@admin_router.callback_query(F.data == "adm:services")
-async def admin_services(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    rows = await list_services_admin()
-    await c.message.edit_text(
-        "🛒 <b>Услуги</b>\n\nВыберите услугу или добавьте новую:",
-        reply_markup=services_list_kb(rows), parse_mode="HTML")
-    await c.answer()
-
-
-def render_service_detail(s):
-    rate = get_exchange_rate()
-    status = "активна" if s[6] else "отключена"
-    owner_c = float(s[4])
-    executor_c = float(s[5])
-    total_c = owner_c + executor_c
-    min_rub = float(s[3]) * rate
-    text = (
-        f"🛒 <b>{s[1]}</b>\n\n"
-        f"{s[2] or '—'}\n\n"
-        f"Минимальная сумма: {s[3]:.2f} USDT (~{min_rub:.0f} RUB)\n"
-        f"Комиссия вам: {owner_c:.2f}%\n"
-        f"Комиссия исполнителю: {executor_c:.2f}%\n"
-        f"Итого комиссия: {total_c:.2f}%\n"
-        f"Статус: {status}\n\n"
-        f"Текущий курс: 1 USDT = {rate:.2f} RUB"
-    )
-    toggle_text = "🚫 Деактивировать" if s[6] else "✅ Активировать"
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=toggle_text, callback_data=f"adm:svctoggle:{s[0]}")],
-        [InlineKeyboardButton(text="📏 Мин. сумма", callback_data=f"adm:svcmin:{s[0]}")],
-        [InlineKeyboardButton(text="💰 Ваша комиссия", callback_data=f"adm:svcowner:{s[0]}")],
-        [InlineKeyboardButton(text="👷 Комиссия испол.", callback_data=f"adm:svcexec:{s[0]}")],
-        [InlineKeyboardButton(text="⬅️ К услугам", callback_data="adm:services")],
-    ])
-    return text, kb
-
-
-@admin_router.callback_query(F.data.startswith("adm:svc:"))
-async def admin_service_detail(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    sid = int(c.data.split(":")[2])
-    s = await get_service(sid)
-    if not s:
-        await c.answer("Услуга не найдена", show_alert=True)
-        return
-    text, kb = render_service_detail(s)
-    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    await c.answer()
-
-
-@admin_router.callback_query(F.data.startswith("adm:svctoggle:"))
-async def admin_service_toggle(c: CallbackQuery):
-    sid = int(c.data.split(":")[2])
-    await toggle_service(sid)
-    s = await get_service(sid)
-    text, kb = render_service_detail(s)
-    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
-    await c.answer("Обновлено")
-
-
-# ---------- Минимальная сумма ----------
-
-@admin_router.callback_query(F.data.startswith("adm:svcmin:"))
-async def admin_service_min_start(c: CallbackQuery, state: FSMContext):
-    sid = int(c.data.split(":")[2])
-    await state.update_data(service_id=sid)
-    await state.set_state(AdminStates.waiting_new_min_amount)
-    rate = get_exchange_rate()
-    await c.message.edit_text(
-        f"📏 Пришлите новую минимальную сумму в USDT (например 10 или 5.50).\n"
-        f"Текущий курс: 1 USDT = {rate:.2f} RUB",
-        reply_markup=admin_back_kb(), parse_mode="HTML")
-    await c.answer()
-
-
-@admin_router.message(AdminStates.waiting_new_min_amount)
-async def admin_service_min_finish(m: Message, state: FSMContext):
-    amount = parse_positive_number(m.text)
-    if amount is None:
-        await m.answer("Нужно положительное число. Попробуйте ещё раз.")
-        return
-    data = await state.get_data()
-    sid = data["service_id"]
-    await set_service_min_amount(sid, amount)
-    await state.clear()
-    s = await get_service(sid)
-    text, kb = render_service_detail(s)
-    await m.answer("✅ Минимальная сумма обновлена.\n\n" + text, reply_markup=kb, parse_mode="HTML")
-
-
-# ---------- Комиссия вам (владельцу) ----------
-
-@admin_router.callback_query(F.data.startswith("adm:svcowner:"))
-async def admin_service_owner_comm_start(c: CallbackQuery, state: FSMContext):
-    sid = int(c.data.split(":")[2])
-    await state.update_data(service_id=sid)
-    await state.set_state(AdminStates.waiting_new_owner_commission)
-    await c.message.edit_text(
-        "💰 Пришлите вашу комиссию в процентах (например 5 или 2.5).",
-        reply_markup=admin_back_kb(), parse_mode="HTML")
-    await c.answer()
-
-
-@admin_router.message(AdminStates.waiting_new_owner_commission)
-async def admin_service_owner_comm_finish(m: Message, state: FSMContext):
-    amount = parse_positive_number(m.text)
-    if amount is None or amount > 100:
-        await m.answer("Нужно число от 0 до 100. Попробуйте ещё раз.")
-        return
-    data = await state.get_data()
-    sid = data["service_id"]
-    await set_service_owner_commission(sid, amount)
-    await state.clear()
-    s = await get_service(sid)
-    text, kb = render_service_detail(s)
-    await m.answer("✅ Ваша комиссия обновлена.\n\n" + text, reply_markup=kb, parse_mode="HTML")
-
-
-# ---------- Комиссия исполнителю ----------
-
-@admin_router.callback_query(F.data.startswith("adm:svcexec:"))
-async def admin_service_executor_comm_start(c: CallbackQuery, state: FSMContext):
-    sid = int(c.data.split(":")[2])
-    await state.update_data(service_id=sid)
-    await state.set_state(AdminStates.waiting_new_executor_commission)
-    await c.message.edit_text(
-        "👷 Пришлите комиссию исполнителю в процентах (например 5 или 2.5).",
-        reply_markup=admin_back_kb(), parse_mode="HTML")
-    await c.answer()
-
-
-@admin_router.message(AdminStates.waiting_new_executor_commission)
-async def admin_service_executor_comm_finish(m: Message, state: FSMContext):
-    amount = parse_positive_number(m.text)
-    if amount is None or amount > 100:
-        await m.answer("Нужно число от 0 до 100. Попробуйте ещё раз.")
-        return
-    data = await state.get_data()
-    sid = data["service_id"]
-    await set_service_executor_commission(sid, amount)
-    await state.clear()
-    s = await get_service(sid)
-    text, kb = render_service_detail(s)
-    await m.answer("✅ Комиссия исполнителя обновлена.\n\n" + text, reply_markup=kb, parse_mode="HTML")
-
-
-# ---------- Добавление услуги ----------
-
-@admin_router.callback_query(F.data == "adm:svcadd")
-async def admin_service_add_start(c: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.waiting_service_name)
-    await c.message.edit_text(
-        "➕ Пришлите название новой услуги.", reply_markup=admin_back_kb())
-    await c.answer()
-
-
-@admin_router.message(AdminStates.waiting_service_name)
-async def admin_service_add_name(m: Message, state: FSMContext):
-    if not m.text or not m.text.strip():
-        await m.answer("Название не может быть пустым. Попробуйте ещё раз.")
-        return
-    await state.update_data(name=m.text.strip())
-    await state.set_state(AdminStates.waiting_service_description)
-    await m.answer("Теперь пришлите описание услуги (или отправьте «-», чтобы оставить пустым).")
-
-
-@admin_router.message(AdminStates.waiting_service_description)
-async def admin_service_add_description(m: Message, state: FSMContext):
-    raw = (m.text or "").strip()
-    desc = "" if raw == "-" else raw
-    await state.update_data(description=desc)
-    await state.set_state(AdminStates.waiting_service_min_amount)
-    rate = get_exchange_rate()
-    await m.answer(f"Теперь пришлите минимальную сумму в USDT (например 10).\nТекущий курс: 1 USDT = {rate:.2f} RUB")
-
-
-@admin_router.message(AdminStates.waiting_service_min_amount)
-async def admin_service_add_min_amount(m: Message, state: FSMContext):
-    amount = parse_positive_number(m.text)
-    if amount is None:
-        await m.answer("Нужно положительное число. Попробуйте ещё раз.")
-        return
-    await state.update_data(min_amount=amount)
-    await state.set_state(AdminStates.waiting_service_owner_commission)
-    await m.answer("Теперь пришлите вашу комиссию в процентах (например 5).")
-
-
-@admin_router.message(AdminStates.waiting_service_owner_commission)
-async def admin_service_add_owner_commission(m: Message, state: FSMContext):
-    comm = parse_positive_number(m.text)
-    if comm is None or comm > 100:
-        await m.answer("Нужно число от 0 до 100. Попробуйте ещё раз.")
-        return
-    await state.update_data(owner_commission=comm)
-    await state.set_state(AdminStates.waiting_service_executor_commission)
-    await m.answer("Теперь пришлите комиссию исполнителю в процентах (например 5).")
-
-
-@admin_router.message(AdminStates.waiting_service_executor_commission)
-async def admin_service_add_executor_commission(m: Message, state: FSMContext):
-    comm = parse_positive_number(m.text)
-    if comm is None or comm > 100:
-        await m.answer("Нужно число от 0 до 100. Попробуйте ещё раз.")
-        return
-    data = await state.get_data()
-    sid = await add_service(data["name"], data["description"], data["min_amount"],
-                           data["owner_commission"], comm)
-    await state.clear()
-    await m.answer(f"✅ Услуга «{data['name']}» добавлена (#{sid}).")
-    rows = await list_services_admin()
-    await m.answer("🛒 <b>Услуги</b>", reply_markup=services_list_kb(rows), parse_mode="HTML")
-
-
-# ---------- Пользователи ----------
-
-def user_profile_kb(user_id, is_executor=False, blocked=False):
-    rows = [
-        [InlineKeyboardButton(text="➕ Начислить", callback_data=f"adm:bal:{user_id}:1"),
-         InlineKeyboardButton(text="➖ Списать", callback_data=f"adm:bal:{user_id}:-1")],
-    ]
-    if is_executor:
-        rows.append([InlineKeyboardButton(text=("🔓 Разблокировать" if blocked else "🚫 Заблокировать"), callback_data=f"adm:execblock:{user_id}:{0 if blocked else 1}")])
-    rows.append([InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-
-@admin_router.callback_query(F.data == "adm:user")
-async def admin_user_start(c: CallbackQuery, state: FSMContext):
-    await state.set_state(AdminStates.waiting_user_query)
-    await c.message.edit_text(
-        "👤 Пришлите Telegram ID или @username пользователя.",
-        reply_markup=admin_back_kb(), parse_mode="HTML")
-    await c.answer()
-
-
-@admin_router.message(AdminStates.waiting_user_query)
-async def admin_user_search(m: Message, state: FSMContext):
-    u = await find_user(m.text or "")
-    if not u:
-        await m.answer("Пользователь не найден. Пришлите ID или @username ещё раз.")
-        return
-    await state.clear()
-    blocked = bool(u[4]) if len(u) > 4 else False
-    role_text = "executor (🚫 заблокирован)" if u[3] == "executor" and blocked else u[3]
-    text = (
-        f"👤 <b>Пользователь</b>\n\nID: <code>{u[0]}</code>\n"
-        f"Username: @{u[1] or '—'}\nБаланс: {u[2]:.2f} USDT\nРоль: {role_text}"
-    )
-    await m.answer(text, reply_markup=user_profile_kb(u[0], u[3] == "executor", blocked), parse_mode="HTML")
-
-
-@admin_router.callback_query(F.data.startswith("adm:execblock:"))
-async def admin_executor_block(c: CallbackQuery):
-    _, _, user_id, action = c.data.split(":")
-    user_id = int(user_id)
-    if action == "1":
-        await block_executor(user_id)
-        message = "🚫 Исполнитель заблокирован."
-    else:
-        await unblock_executor(user_id)
-        message = "🔓 Исполнитель разблокирован."
-    await c.answer(message)
-    u = await find_user(str(user_id))
-    blocked = bool(u[4]) if u and len(u) > 4 else False
-    role_text = "executor (🚫 заблокирован)" if u[3] == "executor" and blocked else u[3]
-    text = (f"👤 <b>Пользователь</b>\n\nID: <code>{u[0]}</code>\n"
-            f"Username: @{u[1] or '—'}\nБаланс: {u[2]:.2f} USDT\nРоль: {role_text}")
-    await c.message.edit_text(text, reply_markup=user_profile_kb(u[0], u[3] == "executor", blocked), parse_mode="HTML")
-
+        await m.bot.send_message(uid, "🚫 <b>Ваш аккаунт заблокирован администрацией.</b>" + (f"\n\nПричина: {escape(reason)}" if reason else ""),parse_mode="HTML")
+    except Exception as e: print(f"[Block notify] {e}")
 
 @admin_router.callback_query(F.data.startswith("adm:bal:"))
 async def admin_balance_start(c: CallbackQuery, state: FSMContext):

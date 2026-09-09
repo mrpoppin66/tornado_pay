@@ -70,6 +70,8 @@ async def init_db():
             executor_city TEXT,
             executor_available BOOLEAN NOT NULL DEFAULT FALSE,
             executor_blocked BOOLEAN NOT NULL DEFAULT FALSE,
+            blocked BOOLEAN NOT NULL DEFAULT FALSE,
+            block_reason TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE TABLE IF NOT EXISTS services(
@@ -77,6 +79,7 @@ async def init_db():
             name TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
             min_amount NUMERIC(14,2) NOT NULL DEFAULT 1.0,
+            max_amount NUMERIC(14,2) NOT NULL DEFAULT 1000000000.0,
             owner_commission NUMERIC(5,2) NOT NULL DEFAULT 0,
             executor_commission NUMERIC(5,2) NOT NULL DEFAULT 0,
             active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -132,6 +135,64 @@ async def init_db():
             comment TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        CREATE TABLE IF NOT EXISTS order_chat_messages(
+            id BIGSERIAL PRIMARY KEY,
+            order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+            sender_id BIGINT NOT NULL REFERENCES users(user_id),
+            recipient_id BIGINT NOT NULL REFERENCES users(user_id),
+            telegram_message_id BIGINT NOT NULL,
+            content_type TEXT NOT NULL,
+            text_content TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_order_chat_messages_order ON order_chat_messages(order_id, id);
+        CREATE TABLE IF NOT EXISTS withdrawal_requests(
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(user_id),
+            amount NUMERIC(18,4) NOT NULL CHECK (amount > 0),
+            wallet TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            admin_comment TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            processed_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_user ON withdrawal_requests(user_id, id);
+        CREATE INDEX IF NOT EXISTS idx_withdrawal_requests_status ON withdrawal_requests(status, id);
+        """)
+
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS order_events(
+            id BIGSERIAL PRIMARY KEY,
+            order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+            actor_id BIGINT REFERENCES users(user_id),
+            event_type TEXT NOT NULL,
+            details TEXT NOT NULL DEFAULT '',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_order_events_order ON order_events(order_id, id);
+        CREATE TABLE IF NOT EXISTS order_evidence(
+            id BIGSERIAL PRIMARY KEY,
+            order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+            sender_id BIGINT NOT NULL REFERENCES users(user_id),
+            telegram_message_id BIGINT NOT NULL,
+            content_type TEXT NOT NULL,
+            caption TEXT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_order_evidence_order ON order_evidence(order_id, id);
+        CREATE TABLE IF NOT EXISTS notifications(
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            order_id INTEGER REFERENCES orders(id) ON DELETE CASCADE,
+            kind TEXT NOT NULL,
+            title TEXT NOT NULL,
+            body TEXT NOT NULL DEFAULT '',
+            read_at TIMESTAMPTZ,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, id DESC);
+        CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(user_id, read_at);
+
         """)
 
         # Миграции для старых баз: добавляем колонки, которых может не хватать
@@ -140,9 +201,15 @@ async def init_db():
         await _add_column_if_missing(conn, "users", "executor_description", "TEXT")
         await _add_column_if_missing(conn, "users", "executor_city", "TEXT")
         await _add_column_if_missing(conn, "users", "executor_available", "BOOLEAN NOT NULL DEFAULT FALSE")
+        # Старые версии использовали wallet для ручного вывода. Адреса больше не собираем:
+        # оставляем колонку только для обратной совместимости, но делаем её необязательной.
+        await conn.execute("ALTER TABLE withdrawal_requests ALTER COLUMN wallet DROP NOT NULL")
         await _add_column_if_missing(conn, "users", "executor_blocked", "BOOLEAN NOT NULL DEFAULT FALSE")
+        await _add_column_if_missing(conn, "users", "blocked", "BOOLEAN NOT NULL DEFAULT FALSE")
+        await _add_column_if_missing(conn, "users", "block_reason", "TEXT")
         await _add_column_if_missing(conn, "users", "created_at", "TIMESTAMPTZ NOT NULL DEFAULT now()")
         await conn.execute("ALTER TABLE users ALTER COLUMN balance TYPE NUMERIC(18,4) USING balance::numeric(18,4)")
+        await _add_column_if_missing(conn, "services", "max_amount", "NUMERIC(14,2) NOT NULL DEFAULT 1000000000.0")
         await _add_column_if_missing(conn, "services", "active", "BOOLEAN NOT NULL DEFAULT TRUE")
         await _add_column_if_missing(conn, "services", "created_at", "TIMESTAMPTZ NOT NULL DEFAULT now()")
         await _add_column_if_missing(conn, "orders", "exchange_rate", "NUMERIC(14,4) NOT NULL DEFAULT 100")
@@ -152,6 +219,7 @@ async def init_db():
         await _add_column_if_missing(conn, "orders", "disputed_at", "TIMESTAMPTZ")
         await _add_column_if_missing(conn, "orders", "settled_at", "TIMESTAMPTZ")
         await _add_column_if_missing(conn, "orders", "escrow_amount_usdt", "NUMERIC(18,4) NOT NULL DEFAULT 0")
+        await _add_column_if_missing(conn, "orders", "settlement_for", "TEXT")
 
         count = await conn.fetchval("SELECT COUNT(*) FROM services")
         if count == 0:
@@ -163,6 +231,9 @@ async def init_db():
                     ("💳 Перевод на карту", "Перевод средств на банковскую карту", 10.0, 5.0, 5.0),
                 ],
             )
+
+        # V10: состояние прочитанных сообщений
+        await conn.execute("""CREATE TABLE IF NOT EXISTS order_chat_reads(order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, last_read_id BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(order_id,user_id)); CREATE INDEX IF NOT EXISTS idx_order_chat_reads_user ON order_chat_reads(user_id, order_id);""")
 
         # Первый fetch курса
         await fetch_exchange_rate()
@@ -182,7 +253,7 @@ async def ensure_user(user_id, username):
 async def get_user(user_id):
     async with pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT user_id, username, balance, role, executor_name, executor_description, executor_city, executor_available FROM users WHERE user_id=$1",
+            "SELECT user_id, username, balance, role, executor_name, executor_description, executor_city, executor_available, executor_blocked, blocked FROM users WHERE user_id=$1",
             user_id,
         )
 
@@ -195,7 +266,7 @@ async def get_services():
 async def get_service(service_id):
     async with pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT id, name, description, min_amount, owner_commission, executor_commission, active FROM services WHERE id=$1",
+            "SELECT id, name, description, min_amount, owner_commission, executor_commission, active, max_amount FROM services WHERE id=$1",
             service_id,
         )
 
@@ -204,13 +275,18 @@ async def create_order(user_id, service_id, amount_rub, rate=None):
     async with pool.acquire() as conn:
         async with conn.transaction():
             service = await conn.fetchrow(
-                "SELECT owner_commission, executor_commission FROM services WHERE id=$1 AND active=TRUE FOR SHARE", service_id
+                "SELECT owner_commission, executor_commission, min_amount, max_amount FROM services WHERE id=$1 AND active=TRUE FOR SHARE", service_id
             )
             if not service:
                 return None, "service_not_found"
             owner_comm = float(service[0]); executor_comm = float(service[1])
+            min_amount = float(service[2]); max_amount = float(service[3])
             rate = float(rate or get_exchange_rate()); amount_rub = float(amount_rub)
             user_amount_usdt = amount_rub / rate
+            if user_amount_usdt < min_amount - 1e-9:
+                return None, "below_minimum"
+            if user_amount_usdt > max_amount + 1e-9:
+                return None, "above_maximum"
             total_comm = owner_comm + executor_comm
             commission_usdt = user_amount_usdt * total_comm / 100
             total_amount_usdt = user_amount_usdt + commission_usdt
@@ -264,7 +340,7 @@ async def get_available_executors():
     async with pool.acquire() as conn:
         return await conn.fetch(
             """SELECT user_id, username, executor_name, executor_description, executor_city
-               FROM users WHERE role='executor' AND executor_available=TRUE ORDER BY user_id"""
+               FROM users WHERE role='executor' AND executor_available=TRUE AND executor_blocked=FALSE AND blocked=FALSE ORDER BY user_id"""
         )
 
 async def get_executor_stats(executor_id):
@@ -305,11 +381,16 @@ async def claim_order(order_id, executor_id):
     async with pool.acquire() as conn:
         async with conn.transaction():
             executor = await conn.fetchrow(
-                "SELECT role, executor_available, executor_blocked FROM users WHERE user_id=$1 FOR UPDATE",
+                "SELECT role, executor_available, executor_blocked, blocked FROM users WHERE user_id=$1 FOR UPDATE",
                 executor_id,
             )
-            if not executor or executor[0] != 'executor' or not executor[1] or executor[2]:
+            if not executor or executor[0] != 'executor' or not executor[1] or executor[2] or executor[3]:
                 return None, 'unavailable'
+            active_order = await conn.fetchval(
+                "SELECT id FROM orders WHERE executor_id=$1 AND status IN ('in_progress','awaiting_confirmation','disputed') LIMIT 1",
+                executor_id)
+            if active_order:
+                return None, 'active_exists'
             order = await conn.fetchrow(
                 "SELECT id, user_id, status, executor_id FROM orders WHERE id=$1 FOR UPDATE",
                 order_id,
@@ -324,6 +405,7 @@ async def claim_order(order_id, executor_id):
                 "UPDATE orders SET executor_id=$1, status='in_progress' WHERE id=$2 AND status='new' AND executor_id IS NULL",
                 executor_id, order_id,
             )
+            await conn.execute("UPDATE users SET executor_available=FALSE WHERE user_id=$1", executor_id)
             return order[1], 'ok'
 
 async def complete_executor_order(order_id, executor_id):
@@ -380,6 +462,84 @@ async def get_executor_orders(executor_id, status=None):
                    ORDER BY o.id DESC LIMIT 20""",
                 executor_id
             )
+
+async def get_executor_active_order(executor_id):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
+                      o.executor_commission_amount, o.status, o.created_at, o.completed_at, o.disputed_at,
+                      o.settlement_for, o.user_id
+               FROM orders o JOIN services s ON s.id=o.service_id
+               WHERE o.executor_id=$1 AND o.status IN ('in_progress','awaiting_confirmation','disputed')
+               ORDER BY o.id DESC LIMIT 1""", executor_id
+        )
+
+async def get_executor_history(executor_id, limit=30):
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.status,
+                      o.settlement_for, o.created_at, o.settled_at
+               FROM orders o JOIN services s ON s.id=o.service_id
+               WHERE o.executor_id=$1 AND o.status IN ('done','cancelled')
+               ORDER BY o.id DESC LIMIT $2""", executor_id, limit
+        )
+
+async def get_pending_withdrawals(limit=30):
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT w.id, w.user_id, u.username, w.amount, w.wallet, w.status, w.created_at
+               FROM withdrawal_requests w JOIN users u ON u.user_id=w.user_id
+               WHERE w.status='pending' ORDER BY w.id ASC LIMIT $1""", limit
+        )
+
+async def create_withdrawal_request(user_id, amount):
+    amount=float(amount)
+    if amount <= 0:
+        return None, 'invalid'
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            user=await conn.fetchrow("SELECT balance FROM users WHERE user_id=$1 FOR UPDATE", user_id)
+            if not user:
+                return None, 'user_not_found'
+            pending=await conn.fetchval("SELECT COUNT(*) FROM withdrawal_requests WHERE user_id=$1 AND status='pending'", user_id)
+            if pending:
+                return None, 'pending_exists'
+            if float(user[0]) + 1e-9 < amount:
+                return None, 'insufficient_balance'
+            wid=await conn.fetchval(
+                "INSERT INTO withdrawal_requests(user_id,amount,wallet) VALUES($1,$2,NULL) RETURNING id",
+                user_id, amount)
+            await conn.execute("UPDATE users SET balance=balance-$1 WHERE user_id=$2", amount, user_id)
+            await conn.execute(
+                "INSERT INTO transactions(user_id,amount,type,description) VALUES($1,$2,'withdrawal_hold',$3)",
+                user_id, -amount, f"Резерв на вывод #{wid}")
+            return wid, 'ok'
+
+async def approve_withdrawal(withdrawal_id, admin_comment=''):
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row=await conn.fetchrow("SELECT user_id,amount,status,wallet FROM withdrawal_requests WHERE id=$1 FOR UPDATE", withdrawal_id)
+            if not row or row[2] != 'pending':
+                return None
+            await conn.execute("UPDATE withdrawal_requests SET status='paid', admin_comment=$1, processed_at=now() WHERE id=$2", admin_comment, withdrawal_id)
+            await conn.execute(
+                "INSERT INTO transactions(user_id,amount,type,description) VALUES($1,$2,'withdrawal_paid',$3)",
+                row[0], 0, f"Вывод #{withdrawal_id} выплачен")
+            return row[0], float(row[1]), row[3]
+
+async def reject_withdrawal(withdrawal_id, admin_comment=''):
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row=await conn.fetchrow("SELECT user_id,amount,status FROM withdrawal_requests WHERE id=$1 FOR UPDATE", withdrawal_id)
+            if not row or row[2] != 'pending':
+                return None
+            amount=float(row[1])
+            await conn.execute("UPDATE users SET balance=balance+$1 WHERE user_id=$2", amount, row[0])
+            await conn.execute("UPDATE withdrawal_requests SET status='rejected', admin_comment=$1, processed_at=now() WHERE id=$2", admin_comment, withdrawal_id)
+            await conn.execute(
+                "INSERT INTO transactions(user_id,amount,type,description) VALUES($1,$2,'withdrawal_refund',$3)",
+                row[0], amount, f"Возврат вывода #{withdrawal_id}")
+            return row[0], amount
 
 # ---------- Заявки исполнителей ----------
 
@@ -523,6 +683,38 @@ async def has_rating(order_id):
             order_id
         )
 
+# ---------- Анонимный чат по заявке ----------
+
+CHAT_OPEN_STATUSES = ("in_progress", "awaiting_confirmation", "disputed")
+
+async def get_order_chat_peer(order_id, user_id):
+    """
+    Вернуть собеседника только если user_id является клиентом или назначенным
+    исполнителем данной заявки. Username намеренно не возвращается.
+    """
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT id, user_id, executor_id, status, service_id
+               FROM orders WHERE id=$1""", order_id
+        )
+        if not row or row[3] not in CHAT_OPEN_STATUSES or not row[2]:
+            return None
+        if row[1] == user_id:
+            return {"order_id": row[0], "peer_id": row[2], "side": "client", "status": row[3]}
+        if row[2] == user_id:
+            return {"order_id": row[0], "peer_id": row[1], "side": "executor", "status": row[3]}
+        return None
+
+async def save_order_chat_message(order_id, sender_id, recipient_id, telegram_message_id, content_type, text_content=None):
+    """Сохранить технический журнал сообщения чата без username/контактных данных."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO order_chat_messages(
+                    order_id, sender_id, recipient_id, telegram_message_id, content_type, text_content
+               ) VALUES($1,$2,$3,$4,$5,$6)""",
+            order_id, sender_id, recipient_id, telegram_message_id, content_type, text_content
+        )
+
 # ---------- Админ: услуги ----------
 
 async def list_services_admin():
@@ -613,7 +805,7 @@ async def settle_order_executor(order_id):
                 return None
             payout = float(row[2]) + float(row[3])
             await conn.execute("UPDATE users SET balance=balance+$1 WHERE user_id=$2", payout, row[1])
-            await conn.execute("UPDATE orders SET status='done', confirmed_at=COALESCE(confirmed_at, now()), settled_at=now(), escrow_amount_usdt=0 WHERE id=$1", order_id)
+            await conn.execute("UPDATE orders SET status='done', confirmed_at=COALESCE(confirmed_at, now()), settled_at=now(), escrow_amount_usdt=0, settlement_for='executor' WHERE id=$1", order_id)
             await conn.execute("INSERT INTO transactions(user_id,order_id,amount,type,description) VALUES($1,$2,$3,'executor_payout',$4)", row[1], order_id, payout, f"Выплата за заявку #{order_id}")
             return row[1], payout
 
@@ -626,7 +818,7 @@ async def refund_order_client(order_id):
                 return None
             refund = float(row[1])
             await conn.execute("UPDATE users SET balance=balance+$1 WHERE user_id=$2", refund, row[0])
-            await conn.execute("UPDATE orders SET status='cancelled', settled_at=now(), escrow_amount_usdt=0 WHERE id=$1", order_id)
+            await conn.execute("UPDATE orders SET status='cancelled', settled_at=now(), escrow_amount_usdt=0, settlement_for='client' WHERE id=$1", order_id)
             await conn.execute("INSERT INTO transactions(user_id,order_id,amount,type,description) VALUES($1,$2,$3,'escrow_refund',$4)", row[0], order_id, refund, f"Возврат по спору #{order_id}")
             return row[0], refund
 
@@ -646,12 +838,12 @@ async def set_order_status(order_id, status):
                     refund = float(row[1])
                     await conn.execute("UPDATE users SET balance=balance+$1 WHERE user_id=$2", refund, row[0])
                     await conn.execute("INSERT INTO transactions(user_id,order_id,amount,type,description) VALUES($1,$2,$3,'escrow_refund',$4)", row[0], order_id, refund, f"Возврат по отменённой заявке #{order_id}")
-                    await conn.execute("UPDATE orders SET escrow_amount_usdt=0, status='cancelled', settled_at=now() WHERE id=$1", order_id)
+                    await conn.execute("UPDATE orders SET escrow_amount_usdt=0, status='cancelled', settled_at=now(), settlement_for='cancelled' WHERE id=$1", order_id)
                     return
             if status == "awaiting_confirmation":
                 await conn.execute("UPDATE orders SET status=$1, completed_at=COALESCE(completed_at, now()) WHERE id=$2", status, order_id)
             else:
-                await conn.execute("UPDATE orders SET status=$1 WHERE id=$2", status, order_id)
+                await conn.execute("UPDATE orders SET status=$1, settlement_for=CASE WHEN $1='cancelled' THEN 'cancelled' ELSE settlement_for END WHERE id=$2", status, order_id)
 
 async def assign_executor(order_id, executor_id):
     async with pool.acquire() as conn:
@@ -666,11 +858,11 @@ async def find_user(query: str):
     async with pool.acquire() as conn:
         if query.isdigit():
             return await conn.fetchrow(
-                "SELECT user_id, username, balance, role, executor_blocked FROM users WHERE user_id=$1",
+                "SELECT user_id, username, balance, role, executor_blocked, blocked, block_reason FROM users WHERE user_id=$1",
                 int(query),
             )
         return await conn.fetchrow(
-            "SELECT user_id, username, balance, role, executor_blocked FROM users WHERE username ILIKE $1",
+            "SELECT user_id, username, balance, role, executor_blocked, blocked, block_reason FROM users WHERE username ILIKE $1",
             query,
         )
 
@@ -679,6 +871,29 @@ async def adjust_balance(user_id, delta):
         return await conn.fetchval(
             "UPDATE users SET balance = balance + $1 WHERE user_id=$2 RETURNING balance",
             delta, user_id,
+        )
+
+async def get_user_transactions(user_id, limit=30):
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT id, amount, type, description, created_at
+               FROM transactions WHERE user_id=$1 ORDER BY id DESC LIMIT $2""",
+            user_id, limit
+        )
+
+async def get_disputed_orders(limit=30):
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT o.id, o.user_id, cu.username AS client_username,
+                      o.executor_id, eu.username AS executor_username,
+                      s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
+                      o.status, o.created_at, o.disputed_at, o.settlement_for
+               FROM orders o
+               JOIN services s ON s.id=o.service_id
+               JOIN users cu ON cu.user_id=o.user_id
+               LEFT JOIN users eu ON eu.user_id=o.executor_id
+               WHERE o.status='disputed'
+               ORDER BY o.id DESC LIMIT $1""", limit
         )
 
 # ---------- Админ: статистика ----------
@@ -703,3 +918,144 @@ async def get_stats():
             "active_services": services_count,
             "executors": executors_count,
         }
+
+# ---------- V10: chat read state / audit ----------
+async def init_v10_db():
+    async with pool.acquire() as conn:
+        await conn.execute("""
+        CREATE TABLE IF NOT EXISTS order_chat_reads(
+            order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
+            user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+            last_read_id BIGINT NOT NULL DEFAULT 0,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY(order_id, user_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_order_chat_reads_user ON order_chat_reads(user_id, order_id);
+        """)
+
+async def get_chat_unread_count(order_id, user_id):
+    async with pool.acquire() as conn:
+        return await conn.fetchval("""
+            SELECT COUNT(*) FROM order_chat_messages m
+            WHERE m.order_id=$1 AND m.recipient_id=$2
+              AND m.id > COALESCE((SELECT last_read_id FROM order_chat_reads WHERE order_id=$1 AND user_id=$2),0)
+        """, order_id, user_id)
+
+async def get_chat_unread_for_orders(order_ids, user_id):
+    if not order_ids:
+        return {}
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("""
+            SELECT m.order_id, COUNT(*) AS cnt
+            FROM order_chat_messages m
+            WHERE m.order_id = ANY($1::int[]) AND m.recipient_id=$2
+              AND m.id > COALESCE((SELECT r.last_read_id FROM order_chat_reads r WHERE r.order_id=m.order_id AND r.user_id=$2),0)
+            GROUP BY m.order_id
+        """, list(order_ids), user_id)
+        return {int(r[0]): int(r[1]) for r in rows}
+
+async def mark_chat_read(order_id, user_id):
+    async with pool.acquire() as conn:
+        last_id = await conn.fetchval("SELECT COALESCE(MAX(id),0) FROM order_chat_messages WHERE order_id=$1", order_id)
+        await conn.execute("""
+            INSERT INTO order_chat_reads(order_id,user_id,last_read_id)
+            VALUES($1,$2,$3)
+            ON CONFLICT(order_id,user_id) DO UPDATE SET last_read_id=EXCLUDED.last_read_id, updated_at=now()
+        """, order_id, user_id, last_id)
+
+async def get_recent_chat_messages(order_id, limit=12):
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT id,sender_id,content_type,text_content,created_at
+            FROM order_chat_messages WHERE order_id=$1 ORDER BY id DESC LIMIT $2
+        """, order_id, limit)
+
+async def get_order_counts_by_status():
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT status, COUNT(*) cnt FROM orders GROUP BY status")
+        return {r[0]: int(r[1]) for r in rows}
+
+async def get_executor_detailed_stats(executor_id):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE status='done') AS completed,
+              COUNT(*) FILTER (WHERE status='cancelled') AS cancelled,
+              COUNT(*) FILTER (WHERE status='disputed') AS disputes,
+              COUNT(*) FILTER (WHERE status='done' AND settlement_for='executor') AS dispute_executor_wins,
+              COUNT(*) FILTER (WHERE status='cancelled' AND settlement_for='client') AS dispute_client_wins,
+              COALESCE(SUM(CASE WHEN status='done' THEN user_amount_usdt + executor_commission_amount ELSE 0 END),0) AS earned
+            FROM orders WHERE executor_id=$1
+        """, executor_id)
+        rating = await conn.fetchrow("SELECT COALESCE(AVG(stars),0), COUNT(*) FROM ratings WHERE to_user_id=$1", executor_id)
+        return {
+            'completed': int(row[0] or 0), 'cancelled': int(row[1] or 0), 'disputes': int(row[2] or 0),
+            'executor_wins': int(row[3] or 0), 'client_wins': int(row[4] or 0), 'earned': float(row[5] or 0),
+            'rating': float(rating[0] or 0), 'ratings': int(rating[1] or 0)
+        }
+
+
+async def log_order_event(order_id, actor_id, event_type, details=''):
+    await pool.execute("INSERT INTO order_events(order_id,actor_id,event_type,details) VALUES($1,$2,$3,$4)", order_id, actor_id, event_type, details[:2000])
+
+async def get_order_events(order_id, limit=100):
+    return await pool.fetch("""SELECT e.id,e.actor_id,e.event_type,e.details,e.created_at,u.role FROM order_events e LEFT JOIN users u ON u.user_id=e.actor_id WHERE e.order_id=$1 ORDER BY e.id DESC LIMIT $2""", order_id, limit)
+
+async def add_order_evidence(order_id, sender_id, telegram_message_id, content_type, caption=''):
+    return await pool.fetchval("INSERT INTO order_evidence(order_id,sender_id,telegram_message_id,content_type,caption) VALUES($1,$2,$3,$4,$5) RETURNING id", order_id, sender_id, telegram_message_id, content_type, (caption or '')[:1000])
+
+async def get_order_evidence(order_id, limit=50):
+    return await pool.fetch("""SELECT id,sender_id,telegram_message_id,content_type,caption,created_at FROM order_evidence WHERE order_id=$1 ORDER BY id DESC LIMIT $2""", order_id, limit)
+
+async def create_notification(user_id, kind, title, body='', order_id=None):
+    return await pool.fetchval("INSERT INTO notifications(user_id,order_id,kind,title,body) VALUES($1,$2,$3,$4,$5) RETURNING id", user_id, order_id, kind, title[:200], body[:2000])
+
+async def get_notifications(user_id, limit=30):
+    return await pool.fetch("SELECT id,order_id,kind,title,body,read_at,created_at FROM notifications WHERE user_id=$1 ORDER BY id DESC LIMIT $2", user_id, limit)
+
+async def get_unread_notifications_count(user_id):
+    return await pool.fetchval("SELECT COUNT(*) FROM notifications WHERE user_id=$1 AND read_at IS NULL", user_id)
+
+async def mark_notifications_read(user_id):
+    await pool.execute("UPDATE notifications SET read_at=now() WHERE user_id=$1 AND read_at IS NULL", user_id)
+
+async def set_user_blocked(user_id, blocked=True):
+    await pool.execute("UPDATE users SET executor_blocked=$2 WHERE user_id=$1", user_id, blocked)
+    if blocked:
+        await pool.execute("UPDATE users SET executor_available=FALSE WHERE user_id=$1", user_id)
+
+async def get_executor_profile(user_id):
+    return await pool.fetchrow("""SELECT u.user_id,u.username,u.executor_name,u.executor_description,u.executor_city,u.executor_available,u.executor_blocked,COALESCE(AVG(r.stars),0),COUNT(r.id) FROM users u LEFT JOIN ratings r ON r.to_user_id=u.user_id WHERE u.user_id=$1 GROUP BY u.user_id""", user_id)
+
+async def get_executor_history_detailed(executor_id, limit=50):
+    return await pool.fetch("""SELECT o.id,s.name,o.amount_rub,o.total_amount_usdt,o.status,o.settlement_for,o.created_at,o.completed_at,o.confirmed_at,o.disputed_at,o.settled_at FROM orders o JOIN services s ON s.id=o.service_id WHERE o.executor_id=$1 ORDER BY o.id DESC LIMIT $2""", executor_id, limit)
+
+async def get_users_admin(limit=50):
+    return await pool.fetch("""SELECT u.user_id,u.username,u.role,u.balance,u.executor_available,u.executor_blocked,u.created_at,COUNT(o.id) AS orders FROM users u LEFT JOIN orders o ON o.user_id=u.user_id GROUP BY u.user_id ORDER BY u.created_at DESC LIMIT $1""", limit)
+
+async def get_service_usage(service_id):
+    return await pool.fetchrow("SELECT COUNT(*) AS orders, COUNT(*) FILTER (WHERE status='done') AS done FROM orders WHERE service_id=$1", service_id)
+
+async def get_all_services_stats():
+    return await pool.fetch("""SELECT s.id,s.name,s.active,COUNT(o.id) orders,COUNT(o.id) FILTER(WHERE o.status='done') done FROM services s LEFT JOIN orders o ON o.service_id=s.id GROUP BY s.id ORDER BY s.id""")
+
+
+async def get_user_blocked(user_id):
+    return bool(await pool.fetchval("SELECT blocked FROM users WHERE user_id=$1", user_id))
+
+async def set_user_blocked_only(user_id, blocked=True, reason=''):
+    await pool.execute("UPDATE users SET blocked=$2, block_reason=$3 WHERE user_id=$1", user_id, blocked, (reason or '')[:1000] if blocked else None)
+    if blocked:
+        await pool.execute("UPDATE users SET executor_available=FALSE WHERE user_id=$1", user_id)
+
+async def get_user_block_info(user_id):
+    return await pool.fetchrow("SELECT blocked,block_reason FROM users WHERE user_id=$1", user_id)
+
+async def list_executors_admin(limit=50):
+    return await pool.fetch("""SELECT u.user_id,u.username,u.executor_name,u.executor_available,u.executor_blocked,u.balance,COUNT(DISTINCT o.id) FILTER(WHERE o.status='done') completed,COALESCE(AVG(r.stars),0) rating,COUNT(DISTINCT r.id) ratings FROM users u LEFT JOIN orders o ON o.executor_id=u.user_id LEFT JOIN ratings r ON r.to_user_id=u.user_id WHERE u.role='executor' GROUP BY u.user_id ORDER BY u.user_id DESC LIMIT $1""", limit)
+
+async def set_service_max_amount(service_id, max_amount):
+    await pool.execute("UPDATE services SET max_amount=$2 WHERE id=$1", service_id, max_amount)
+
+async def get_service_limits(service_id):
+    return await pool.fetchrow("SELECT min_amount,max_amount FROM services WHERE id=$1", service_id)
