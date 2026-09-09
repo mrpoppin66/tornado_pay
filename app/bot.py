@@ -1,10 +1,11 @@
 import os
 from html import escape
-from aiogram import Bot, Dispatcher, F
+from typing import Any, Awaitable, Callable, Dict
+from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, TelegramObject
 from dotenv import load_dotenv
 from .db import (
     init_db, close_db, ensure_user, get_user, get_services, get_service, create_order, calculate_order_commission,
@@ -18,6 +19,7 @@ from .db import (
     mark_chat_read, get_recent_chat_messages, get_executor_detailed_stats,
     add_order_evidence, log_order_event, create_notification, get_notifications, get_unread_notifications_count, mark_notifications_read,
     get_order_events, get_order_evidence, set_user_blocked, get_executor_profile, get_executor_history_detailed, get_user_blocked,
+    get_user_agreement_accepted, accept_user_agreement,
 )
 from .admin import admin_router, ADMIN_IDS
 
@@ -31,6 +33,59 @@ dp.include_router(admin_router)
 
 START_BANNER_PATH = os.path.join(os.path.dirname(__file__), "assets", "start_banner.png")
 SUPPORT_BANNER_PATH = os.path.join(os.path.dirname(__file__), "assets", "support_banner.png")
+AGREEMENT_URL = "https://telegra.ph/Polzovatelskoe-soglashenie-servisa-TornadoPay-09-09"
+
+
+def agreement_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📄 Читать соглашение", url=AGREEMENT_URL)],
+        [InlineKeyboardButton(text="✅ Я принимаю условия", callback_data="agree_tos")],
+    ])
+
+
+class AgreementMiddleware(BaseMiddleware):
+    """Блокирует любые действия в боте, пока пользователь не принял
+    пользовательское соглашение. Пропускает только /start (там пользователь
+    и видит предложение принять условия) и саму кнопку принятия."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+
+        if isinstance(event, Message):
+            if event.text and event.text.split()[0].split("@")[0] == "/start":
+                return await handler(event, data)
+        elif isinstance(event, CallbackQuery):
+            if event.data == "agree_tos":
+                return await handler(event, data)
+
+        accepted = await get_user_agreement_accepted(user.id)
+        if accepted:
+            return await handler(event, data)
+
+        warning = (
+            "⚠️ Чтобы пользоваться TornadoPay, необходимо принять "
+            "пользовательское соглашение сервиса."
+        )
+        if isinstance(event, CallbackQuery):
+            await event.answer("Сначала примите условия соглашения.", show_alert=True)
+            try:
+                await event.message.answer(warning, reply_markup=agreement_kb(), parse_mode="HTML")
+            except Exception:
+                pass
+        elif isinstance(event, Message):
+            await event.answer(warning, reply_markup=agreement_kb(), parse_mode="HTML")
+        return None
+
+
+dp.message.outer_middleware(AgreementMiddleware())
+dp.callback_query.outer_middleware(AgreementMiddleware())
 
 class UserStates(StatesGroup):
     waiting_order_amount = State()
@@ -141,6 +196,16 @@ async def order_chat_message(m: Message, state: FSMContext):
 @dp.message(CommandStart())
 async def start(m: Message):
     await ensure_user(m.from_user.id, m.from_user.username)
+
+    if not await get_user_agreement_accepted(m.from_user.id):
+        await m.answer(
+            "👋 Добро пожаловать в <b>TornadoPay</b>!\n\n"
+            "Прежде чем начать работу, пожалуйста, ознакомьтесь с "
+            "пользовательским соглашением сервиса и примите его условия — "
+            "это обязательное условие для использования Бота.",
+            reply_markup=agreement_kb(), parse_mode="HTML")
+        return
+
     user = await get_user(m.from_user.id)
     rate = get_exchange_rate()
     caption = (
@@ -155,6 +220,30 @@ async def start(m: Message):
     except Exception as e:
         print(f"[start banner] {e}")
         await m.answer(caption, reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data == "agree_tos")
+async def agree_tos(c: CallbackQuery):
+    await accept_user_agreement(c.from_user.id)
+    user = await get_user(c.from_user.id)
+    rate = get_exchange_rate()
+    caption = (
+        f"✅ Спасибо! Условия пользовательского соглашения приняты.\n\n"
+        f"👋 Добро пожаловать в <b>TornadoPay</b>!\n\n"
+        f"Маркетплейс услуг с оплатой в криптовалюте.\n"
+        f"Выберите услугу и укажите сумму в рублях.\n\n"
+        f"📊 Текущий курс: 1 USDT = {rate:.2f} RUB"
+    )
+    kb = menu(c.from_user.id, user[3] if user else None)
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
+    try:
+        await c.message.answer_photo(FSInputFile(START_BANNER_PATH), caption=caption, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        print(f"[start banner] {e}")
+        await c.message.answer(caption, reply_markup=kb, parse_mode="HTML")
+    await c.answer()
 
 @dp.callback_query(F.data == "balance")
 async def balance(c: CallbackQuery):

@@ -242,6 +242,7 @@ async def init_db():
         await _add_column_if_missing(conn, "users", "blocked", "BOOLEAN NOT NULL DEFAULT FALSE")
         await _add_column_if_missing(conn, "users", "block_reason", "TEXT")
         await _add_column_if_missing(conn, "users", "created_at", "TIMESTAMPTZ NOT NULL DEFAULT now()")
+        await _add_column_if_missing(conn, "users", "agreement_accepted_at", "TIMESTAMPTZ")
         await conn.execute("ALTER TABLE users ALTER COLUMN balance TYPE NUMERIC(18,4) USING balance::numeric(18,4)")
         await _add_column_if_missing(conn, "services", "max_amount", "NUMERIC(14,2) NOT NULL DEFAULT 1000000000.0")
         await _add_column_if_missing(conn, "services", "active", "BOOLEAN NOT NULL DEFAULT TRUE")
@@ -282,6 +283,22 @@ async def ensure_user(user_id, username):
             """INSERT INTO users(user_id, username) VALUES($1, $2)
                ON CONFLICT (user_id) DO UPDATE SET username = EXCLUDED.username""",
             user_id, username,
+        )
+
+async def get_user_agreement_accepted(user_id):
+    """Принял ли пользователь пользовательское соглашение."""
+    async with pool.acquire() as conn:
+        value = await conn.fetchval(
+            "SELECT agreement_accepted_at FROM users WHERE user_id=$1", user_id
+        )
+        return value is not None
+
+async def accept_user_agreement(user_id):
+    """Зафиксировать факт принятия пользовательского соглашения."""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET agreement_accepted_at = now() WHERE user_id=$1 AND agreement_accepted_at IS NULL",
+            user_id,
         )
 
 async def get_user(user_id):
