@@ -18,7 +18,9 @@ from .db import (
     get_stats,
     list_services_admin,
     set_order_status,
-    set_service_price,
+    set_service_min_amount,
+    set_service_owner_commission,
+    set_service_executor_commission,
     toggle_service,
 )
 
@@ -32,8 +34,12 @@ admin_router.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
 class AdminStates(StatesGroup):
     waiting_service_name = State()
     waiting_service_description = State()
-    waiting_service_price = State()
-    waiting_new_price = State()
+    waiting_service_min_amount = State()
+    waiting_service_owner_commission = State()
+    waiting_service_executor_commission = State()
+    waiting_new_min_amount = State()
+    waiting_new_owner_commission = State()
+    waiting_new_executor_commission = State()
     waiting_executor_id = State()
     waiting_user_query = State()
     waiting_balance_amount = State()
@@ -107,7 +113,7 @@ async def admin_orders(c: CallbackQuery, state: FSMContext):
     kb = orders_tabs_rows(status)
     for o in rows:
         kb.append([InlineKeyboardButton(
-            text=f"#{o[0]} — {o[3]} — {o[4]:.0f} USDT — @{o[2] or o[1]}",
+            text=f"#{o[0]} — {o[3]} — {o[4]:.0f} USDT (итого {o[5]:.0f}) — @{o[2] or o[1]}",
             callback_data=f"adm:order:{o[0]}",
         )])
     kb.append([InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")])
@@ -119,23 +125,29 @@ async def admin_orders(c: CallbackQuery, state: FSMContext):
 
 
 def render_order_detail(o):
+    owner_comm = float(o[6])
+    executor_comm = float(o[7])
     text = (
         f"🧾 <b>Заявка #{o[0]}</b>\n\n"
         f"Клиент: @{o[2] or '—'} (<code>{o[1]}</code>)\n"
-        f"Услуга: {o[3]}\nСумма: {o[4]:.2f} USDT\n"
-        f"Статус: {ORDER_STATUS_LABELS.get(o[5], o[5])}\n"
-        f"Исполнитель: {o[6] or '—'}\n"
-        f"Создана: {o[7]:%d.%m.%Y %H:%M}"
+        f"Услуга: {o[3]}\n"
+        f"Сумма услуги: {o[4]:.2f} USDT\n"
+        f"Итого к оплате: {o[5]:.2f} USDT\n"
+        f"Комиссия вам: {owner_comm:.2f} USDT\n"
+        f"Комиссия исполнителю: {executor_comm:.2f} USDT\n"
+        f"Статус: {ORDER_STATUS_LABELS.get(o[8], o[8])}\n"
+        f"Исполнитель: {o[9] or '—'}\n"
+        f"Создана: {o[10]:%d.%m.%Y %H:%M}"
     )
     buttons = []
-    if o[5] == "new":
+    if o[8] == "new":
         buttons.append([InlineKeyboardButton(text="🔧 Взять в работу", callback_data=f"adm:ordstatus:{o[0]}:in_progress")])
-    if o[5] == "in_progress":
+    if o[8] == "in_progress":
         buttons.append([InlineKeyboardButton(text="✅ Отметить выполненной", callback_data=f"adm:ordstatus:{o[0]}:done")])
-    if o[5] in ("new", "in_progress"):
+    if o[8] in ("new", "in_progress"):
         buttons.append([InlineKeyboardButton(text="❌ Отменить", callback_data=f"adm:ordstatus:{o[0]}:cancelled")])
         buttons.append([InlineKeyboardButton(text="👷 Назначить исполнителя", callback_data=f"adm:ordexec:{o[0]}")])
-    buttons.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"adm:orders:{o[5]}")])
+    buttons.append([InlineKeyboardButton(text="⬅️ К списку", callback_data=f"adm:orders:{o[8]}")])
     return text, InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
@@ -192,8 +204,14 @@ async def admin_order_exec_finish(m: Message, state: FSMContext):
 def services_list_kb(rows):
     kb = []
     for s in rows:
-        mark = "✅" if s[4] else "🚫"
-        kb.append([InlineKeyboardButton(text=f"{mark} {s[1]} — {s[3]:.0f} USDT", callback_data=f"adm:svc:{s[0]}")])
+        mark = "✅" if s[6] else "🚫"
+        owner_c = float(s[4])
+        executor_c = float(s[5])
+        total_c = owner_c + executor_c
+        kb.append([InlineKeyboardButton(
+            text=f"{mark} {s[1]} | мин {s[3]:.2f} | комиссия {total_c:.1f}%",
+            callback_data=f"adm:svc:{s[0]}"
+        )])
     kb.append([InlineKeyboardButton(text="➕ Добавить услугу", callback_data="adm:svcadd")])
     kb.append([InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")])
     return InlineKeyboardMarkup(inline_keyboard=kb)
@@ -210,12 +228,25 @@ async def admin_services(c: CallbackQuery, state: FSMContext):
 
 
 def render_service_detail(s):
-    status = "активна" if s[4] else "отключена"
-    text = f"🛒 <b>{s[1]}</b>\n\n{s[2] or '—'}\n\nЦена: {s[3]:.2f} USDT\nСтатус: {status}"
-    toggle_text = "🚫 Деактивировать" if s[4] else "✅ Активировать"
+    status = "активна" if s[6] else "отключена"
+    owner_c = float(s[4])
+    executor_c = float(s[5])
+    total_c = owner_c + executor_c
+    text = (
+        f"🛒 <b>{s[1]}</b>\n\n"
+        f"{s[2] or '—'}\n\n"
+        f"Минимальная сумма: {s[3]:.2f} USDT\n"
+        f"Комиссия вам: {owner_c:.2f}%\n"
+        f"Комиссия исполнителю: {executor_c:.2f}%\n"
+        f"Итого комиссия: {total_c:.2f}%\n"
+        f"Статус: {status}"
+    )
+    toggle_text = "🚫 Деактивировать" if s[6] else "✅ Активировать"
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text=toggle_text, callback_data=f"adm:svctoggle:{s[0]}")],
-        [InlineKeyboardButton(text="💲 Изменить цену", callback_data=f"adm:svcprice:{s[0]}")],
+        [InlineKeyboardButton(text="📏 Мин. сумма", callback_data=f"adm:svcmin:{s[0]}")],
+        [InlineKeyboardButton(text="💰 Ваша комиссия", callback_data=f"adm:svcowner:{s[0]}")],
+        [InlineKeyboardButton(text="👷 Комиссия испол.", callback_data=f"adm:svcexec:{s[0]}")],
         [InlineKeyboardButton(text="⬅️ К услугам", callback_data="adm:services")],
     ])
     return text, kb
@@ -244,31 +275,91 @@ async def admin_service_toggle(c: CallbackQuery):
     await c.answer("Обновлено")
 
 
-@admin_router.callback_query(F.data.startswith("adm:svcprice:"))
-async def admin_service_price_start(c: CallbackQuery, state: FSMContext):
+# ---------- Минимальная сумма ----------
+
+@admin_router.callback_query(F.data.startswith("adm:svcmin:"))
+async def admin_service_min_start(c: CallbackQuery, state: FSMContext):
     sid = int(c.data.split(":")[2])
     await state.update_data(service_id=sid)
-    await state.set_state(AdminStates.waiting_new_price)
+    await state.set_state(AdminStates.waiting_new_min_amount)
     await c.message.edit_text(
-        "💲 Пришлите новую цену числом (например 150 или 150.50).",
+        "📏 Пришлите новую минимальную сумму числом (например 10 или 5.50).",
         reply_markup=admin_back_kb(), parse_mode="HTML")
     await c.answer()
 
 
-@admin_router.message(AdminStates.waiting_new_price)
-async def admin_service_price_finish(m: Message, state: FSMContext):
-    price = parse_positive_number(m.text)
-    if price is None:
+@admin_router.message(AdminStates.waiting_new_min_amount)
+async def admin_service_min_finish(m: Message, state: FSMContext):
+    amount = parse_positive_number(m.text)
+    if amount is None:
         await m.answer("Нужно положительное число. Попробуйте ещё раз.")
         return
     data = await state.get_data()
     sid = data["service_id"]
-    await set_service_price(sid, price)
+    await set_service_min_amount(sid, amount)
     await state.clear()
     s = await get_service(sid)
     text, kb = render_service_detail(s)
-    await m.answer("✅ Цена обновлена.\n\n" + text, reply_markup=kb, parse_mode="HTML")
+    await m.answer("✅ Минимальная сумма обновлена.\n\n" + text, reply_markup=kb, parse_mode="HTML")
 
+
+# ---------- Комиссия вам (владельцу) ----------
+
+@admin_router.callback_query(F.data.startswith("adm:svcowner:"))
+async def admin_service_owner_comm_start(c: CallbackQuery, state: FSMContext):
+    sid = int(c.data.split(":")[2])
+    await state.update_data(service_id=sid)
+    await state.set_state(AdminStates.waiting_new_owner_commission)
+    await c.message.edit_text(
+        "💰 Пришлите вашу комиссию в процентах (например 5 или 2.5).",
+        reply_markup=admin_back_kb(), parse_mode="HTML")
+    await c.answer()
+
+
+@admin_router.message(AdminStates.waiting_new_owner_commission)
+async def admin_service_owner_comm_finish(m: Message, state: FSMContext):
+    amount = parse_positive_number(m.text)
+    if amount is None or amount > 100:
+        await m.answer("Нужно число от 0 до 100. Попробуйте ещё раз.")
+        return
+    data = await state.get_data()
+    sid = data["service_id"]
+    await set_service_owner_commission(sid, amount)
+    await state.clear()
+    s = await get_service(sid)
+    text, kb = render_service_detail(s)
+    await m.answer("✅ Ваша комиссия обновлена.\n\n" + text, reply_markup=kb, parse_mode="HTML")
+
+
+# ---------- Комиссия исполнителю ----------
+
+@admin_router.callback_query(F.data.startswith("adm:svcexec:"))
+async def admin_service_executor_comm_start(c: CallbackQuery, state: FSMContext):
+    sid = int(c.data.split(":")[2])
+    await state.update_data(service_id=sid)
+    await state.set_state(AdminStates.waiting_new_executor_commission)
+    await c.message.edit_text(
+        "👷 Пришлите комиссию исполнителю в процентах (например 5 или 2.5).",
+        reply_markup=admin_back_kb(), parse_mode="HTML")
+    await c.answer()
+
+
+@admin_router.message(AdminStates.waiting_new_executor_commission)
+async def admin_service_executor_comm_finish(m: Message, state: FSMContext):
+    amount = parse_positive_number(m.text)
+    if amount is None or amount > 100:
+        await m.answer("Нужно число от 0 до 100. Попробуйте ещё раз.")
+        return
+    data = await state.get_data()
+    sid = data["service_id"]
+    await set_service_executor_commission(sid, amount)
+    await state.clear()
+    s = await get_service(sid)
+    text, kb = render_service_detail(s)
+    await m.answer("✅ Комиссия исполнителя обновлена.\n\n" + text, reply_markup=kb, parse_mode="HTML")
+
+
+# ---------- Добавление услуги ----------
 
 @admin_router.callback_query(F.data == "adm:svcadd")
 async def admin_service_add_start(c: CallbackQuery, state: FSMContext):
@@ -293,18 +384,41 @@ async def admin_service_add_description(m: Message, state: FSMContext):
     raw = (m.text or "").strip()
     desc = "" if raw == "-" else raw
     await state.update_data(description=desc)
-    await state.set_state(AdminStates.waiting_service_price)
-    await m.answer("Теперь пришлите цену числом (например 150).")
+    await state.set_state(AdminStates.waiting_service_min_amount)
+    await m.answer("Теперь пришлите минимальную сумму заявки (например 10).")
 
 
-@admin_router.message(AdminStates.waiting_service_price)
-async def admin_service_add_price(m: Message, state: FSMContext):
-    price = parse_positive_number(m.text)
-    if price is None:
+@admin_router.message(AdminStates.waiting_service_min_amount)
+async def admin_service_add_min_amount(m: Message, state: FSMContext):
+    amount = parse_positive_number(m.text)
+    if amount is None:
         await m.answer("Нужно положительное число. Попробуйте ещё раз.")
         return
+    await state.update_data(min_amount=amount)
+    await state.set_state(AdminStates.waiting_service_owner_commission)
+    await m.answer("Теперь пришлите вашу комиссию в процентах (например 5).")
+
+
+@admin_router.message(AdminStates.waiting_service_owner_commission)
+async def admin_service_add_owner_commission(m: Message, state: FSMContext):
+    comm = parse_positive_number(m.text)
+    if comm is None or comm > 100:
+        await m.answer("Нужно число от 0 до 100. Попробуйте ещё раз.")
+        return
+    await state.update_data(owner_commission=comm)
+    await state.set_state(AdminStates.waiting_service_executor_commission)
+    await m.answer("Теперь пришлите комиссию исполнителю в процентах (например 5).")
+
+
+@admin_router.message(AdminStates.waiting_service_executor_commission)
+async def admin_service_add_executor_commission(m: Message, state: FSMContext):
+    comm = parse_positive_number(m.text)
+    if comm is None or comm > 100:
+        await m.answer("Нужно число от 0 до 100. Попробуйте ещё раз.")
+        return
     data = await state.get_data()
-    sid = await add_service(data["name"], data["description"], price)
+    sid = await add_service(data["name"], data["description"], data["min_amount"],
+                           data["owner_commission"], comm)
     await state.clear()
     await m.answer(f"✅ Услуга «{data['name']}» добавлена (#{sid}).")
     rows = await list_services_admin()
