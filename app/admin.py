@@ -141,11 +141,7 @@ def render_order_detail(o):
     user_amount_usdt = float(o[5])
     executor_gets_usdt = float(o[6])
     amount_rub = float(o[4])
-<<<<<<< HEAD
 
-=======
-    
->>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
     text = (
         f"🧾 <b>Заявка #{o[0]}</b>\n\n"
         f"Клиент: @{o[2] or '—'} (<code>{o[1]}</code>)\n"
@@ -163,7 +159,6 @@ def render_order_detail(o):
     if o[9] == "new":
         buttons.append([InlineKeyboardButton(text="🔧 Взять в работу", callback_data=f"adm:ordstatus:{o[0]}:in_progress")])
     if o[9] == "in_progress":
-<<<<<<< HEAD
         buttons.append([InlineKeyboardButton(text="✅ Отметить выполненной", callback_data=f"adm:ordstatus:{o[0]}:awaiting_confirmation")])
     if o[9] == "awaiting_confirmation":
         buttons.append([InlineKeyboardButton(text="💸 Выпустить оплату исполнителю", callback_data=f"adm:settle:{o[0]}:executor")])
@@ -171,9 +166,6 @@ def render_order_detail(o):
     if o[9] == "disputed":
         buttons.append([InlineKeyboardButton(text="👷 В пользу исполнителя", callback_data=f"adm:settle:{o[0]}:executor")])
         buttons.append([InlineKeyboardButton(text="👤 Вернуть клиенту", callback_data=f"adm:settle:{o[0]}:client")])
-=======
-        buttons.append([InlineKeyboardButton(text="✅ Отметить выполненной", callback_data=f"adm:ordstatus:{o[0]}:done")])
->>>>>>> 2d9d72719a02f678dcd9f49b9dd0b8e868a18a43
     if o[9] in ("new", "in_progress"):
         buttons.append([InlineKeyboardButton(text="❌ Отменить", callback_data=f"adm:ordstatus:{o[0]}:cancelled")])
         buttons.append([InlineKeyboardButton(text="👷 Назначить исполнителя", callback_data=f"adm:ordexec:{o[0]}")])
