@@ -23,30 +23,34 @@ async def init_db():
             id SERIAL PRIMARY KEY,
             name TEXT NOT NULL,
             description TEXT NOT NULL DEFAULT '',
-            active BOOLEAN NOT NULL DEFAULT TRUE
+            min_amount NUMERIC(14,2) NOT NULL DEFAULT 1.0,
+            owner_commission NUMERIC(5,2) NOT NULL DEFAULT 0,
+            executor_commission NUMERIC(5,2) NOT NULL DEFAULT 0,
+            active BOOLEAN NOT NULL DEFAULT TRUE,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         CREATE TABLE IF NOT EXISTS orders(
             id SERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL REFERENCES users(user_id),
             service_id INTEGER NOT NULL REFERENCES services(id),
-            amount NUMERIC(14,2) NOT NULL DEFAULT 0,
+            user_amount NUMERIC(14,2) NOT NULL,
+            total_amount NUMERIC(14,2) NOT NULL,
+            owner_commission_amount NUMERIC(14,2) NOT NULL,
+            executor_commission_amount NUMERIC(14,2) NOT NULL,
             status TEXT NOT NULL DEFAULT 'new',
             executor_id BIGINT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
         """)
-        # На случай если таблица services уже существовала без цены (миграция).
-        await conn.execute(
-            "ALTER TABLE services ADD COLUMN IF NOT EXISTS price NUMERIC(14,2) NOT NULL DEFAULT 0"
-        )
+        
         count = await conn.fetchval("SELECT COUNT(*) FROM services")
         if count == 0:
             await conn.executemany(
-                "INSERT INTO services(name, description) VALUES($1, $2)",
+                "INSERT INTO services(name, description, min_amount, owner_commission, executor_commission) VALUES($1, $2, $3, $4, $5)",
                 [
-                    ("📱 Пополнение мобильного", "Пополнение номера телефона"),
-                    ("🧾 Оплата по QR", "Оплата по предоставленному QR-коду"),
-                    ("💳 Перевод на карту", "Перевод средств на банковскую карту"),
+                    ("📱 Пополнение мобильного", "Пополнение номера телефона", 1.0, 5.0, 5.0),
+                    ("🧾 Оплата по QR", "Оплата по предоставленному QR-коду", 1.0, 5.0, 5.0),
+                    ("💳 Перевод на карту", "Перевод средств на банковскую карту", 1.0, 5.0, 5.0),
                 ],
             )
 
@@ -72,20 +76,55 @@ async def get_user(user_id):
 async def get_services():
     async with pool.acquire() as conn:
         return await conn.fetch(
-            "SELECT id, name, description, price FROM services WHERE active=TRUE ORDER BY id"
+            "SELECT id, name, description, min_amount, owner_commission, executor_commission FROM services WHERE active=TRUE ORDER BY id"
         )
 
-async def create_order(user_id, service_id, amount=0):
+async def get_service(service_id):
     async with pool.acquire() as conn:
-        return await conn.fetchval(
-            "INSERT INTO orders(user_id, service_id, amount) VALUES($1, $2, $3) RETURNING id",
-            user_id, service_id, amount,
+        return await conn.fetchrow(
+            "SELECT id, name, description, min_amount, owner_commission, executor_commission, active FROM services WHERE id=$1",
+            service_id,
         )
+
+async def create_order(user_id, service_id, user_amount):
+    """
+    Создаёт заявку с расчётом комиссии.
+    user_amount - сумма, которую вводит пользователь
+    total_amount = user_amount + комиссия
+    """
+    async with pool.acquire() as conn:
+        # Получаем параметры услуги
+        service = await conn.fetchrow(
+            "SELECT owner_commission, executor_commission FROM services WHERE id=$1",
+            service_id
+        )
+        if not service:
+            return None
+        
+        owner_comm = float(service[0])
+        executor_comm = float(service[1])
+        total_comm = owner_comm + executor_comm
+        
+        # Расчёт сумм
+        user_amount = float(user_amount)
+        commission = user_amount * (total_comm / 100)
+        total_amount = user_amount + commission
+        owner_commission_amount = user_amount * (owner_comm / 100)
+        executor_commission_amount = user_amount * (executor_comm / 100)
+        
+        order_id = await conn.fetchval(
+            """INSERT INTO orders(user_id, service_id, user_amount, total_amount, 
+                                   owner_commission_amount, executor_commission_amount) 
+               VALUES($1, $2, $3, $4, $5, $6) RETURNING id""",
+            user_id, service_id, user_amount, total_amount, 
+            owner_commission_amount, executor_commission_amount
+        )
+        return order_id
 
 async def get_orders(user_id):
     async with pool.acquire() as conn:
         return await conn.fetch(
-            """SELECT o.id, s.name, o.amount, o.status, o.executor_id, o.created_at
+            """SELECT o.id, s.name, o.user_amount, o.total_amount, o.status, o.executor_id, o.created_at
                FROM orders o JOIN services s ON s.id = o.service_id
                WHERE o.user_id = $1 ORDER BY o.id DESC LIMIT 20""",
             user_id,
@@ -96,21 +135,15 @@ async def get_orders(user_id):
 async def list_services_admin():
     async with pool.acquire() as conn:
         return await conn.fetch(
-            "SELECT id, name, description, price, active FROM services ORDER BY id"
+            "SELECT id, name, description, min_amount, owner_commission, executor_commission, active FROM services ORDER BY id"
         )
 
-async def get_service(service_id):
-    async with pool.acquire() as conn:
-        return await conn.fetchrow(
-            "SELECT id, name, description, price, active FROM services WHERE id=$1",
-            service_id,
-        )
-
-async def add_service(name, description, price):
+async def add_service(name, description, min_amount, owner_commission, executor_commission):
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "INSERT INTO services(name, description, price) VALUES($1, $2, $3) RETURNING id",
-            name, description, price,
+            """INSERT INTO services(name, description, min_amount, owner_commission, executor_commission) 
+               VALUES($1, $2, $3, $4, $5) RETURNING id""",
+            name, description, min_amount, owner_commission, executor_commission,
         )
 
 async def toggle_service(service_id):
@@ -120,10 +153,22 @@ async def toggle_service(service_id):
             service_id,
         )
 
-async def set_service_price(service_id, price):
+async def set_service_min_amount(service_id, min_amount):
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE services SET price=$1 WHERE id=$2", price, service_id
+            "UPDATE services SET min_amount=$1 WHERE id=$2", min_amount, service_id
+        )
+
+async def set_service_owner_commission(service_id, commission):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE services SET owner_commission=$1 WHERE id=$2", commission, service_id
+        )
+
+async def set_service_executor_commission(service_id, commission):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE services SET executor_commission=$1 WHERE id=$2", commission, service_id
         )
 
 # ---------- Админ: заявки ----------
@@ -139,7 +184,8 @@ ORDER_STATUS_LABELS = {
 async def get_orders_by_status(status, limit=15):
     async with pool.acquire() as conn:
         return await conn.fetch(
-            """SELECT o.id, o.user_id, u.username, s.name, o.amount, o.status,
+            """SELECT o.id, o.user_id, u.username, s.name, o.user_amount, o.total_amount, 
+                      o.owner_commission_amount, o.executor_commission_amount, o.status,
                       o.executor_id, o.created_at
                FROM orders o
                JOIN services s ON s.id = o.service_id
@@ -152,7 +198,8 @@ async def get_orders_by_status(status, limit=15):
 async def get_order(order_id):
     async with pool.acquire() as conn:
         return await conn.fetchrow(
-            """SELECT o.id, o.user_id, u.username, s.name, o.amount, o.status,
+            """SELECT o.id, o.user_id, u.username, s.name, o.user_amount, o.total_amount,
+                      o.owner_commission_amount, o.executor_commission_amount, o.status,
                       o.executor_id, o.created_at
                FROM orders o
                JOIN services s ON s.id = o.service_id
