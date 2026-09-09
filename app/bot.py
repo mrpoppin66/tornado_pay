@@ -814,11 +814,24 @@ async def go_back(c: CallbackQuery, state: FSMContext):
     await state.clear()
     rate = get_exchange_rate()
     u = await get_user(c.from_user.id)
-    await safe_edit(c,
+    caption = (
         f"🏠 <b>TornadoPay</b>\n\n"
         f"Выберите раздел:\n\n"
-        f"📊 Курс: 1 USDT = {rate:.2f} RUB",
-        reply_markup=menu(c.from_user.id, u[3] if u else None), parse_mode="HTML")
+        f"📊 Курс: 1 USDT = {rate:.2f} RUB"
+    )
+    kb = menu(c.from_user.id, u[3] if u else None)
+    # Главное меню всегда должно быть фото-сообщением с баннером, поэтому
+    # старое сообщение (текстовое или фото) удаляется и отправляется новое
+    # фото-сообщение — так же, как это делает /start.
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
+    try:
+        await c.message.answer_photo(FSInputFile(START_BANNER_PATH), caption=caption, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        print(f"[start banner] {e}")
+        await c.message.answer(caption, reply_markup=kb, parse_mode="HTML")
     await c.answer()
 
 async def main():
