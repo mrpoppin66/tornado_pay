@@ -76,6 +76,7 @@ class AdminStates(StatesGroup):
     waiting_executor_question = State()
     waiting_executor_rejection = State()
     waiting_block_reason = State()
+    waiting_emoji_probe = State()
 
 
 def parse_positive_number(text):
@@ -125,6 +126,40 @@ def user_profile_kb(user_id, is_executor, blocked):
 async def admin_entry(m: Message, state: FSMContext):
     await state.clear()
     await m.answer("🛠 <b>Админ-панель</b>", reply_markup=admin_menu_kb(), parse_mode="HTML")
+
+
+@admin_router.message(Command("emoji_id"))
+async def emoji_id_prompt(m: Message, state: FSMContext):
+    """Служебная команда для админа: узнать custom_emoji_id премиум-эмодзи,
+    чтобы использовать их на кнопках (InlineKeyboardButton.icon_custom_emoji_id)."""
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(AdminStates.waiting_emoji_probe)
+    await m.answer(
+        "Отправьте следующим сообщением текст с нужными премиум-эмодзи "
+        "(вставьте их из вкладки Premium в панели эмодзи Telegram, обычные "
+        "юникод-смайлы не подойдут) — пришлю их custom_emoji_id.",
+    )
+
+
+@admin_router.message(AdminStates.waiting_emoji_probe)
+async def emoji_id_capture(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    await state.clear()
+    entities = m.entities or []
+    found = [e for e in entities if e.type == "custom_emoji"]
+    if not found:
+        await m.answer(
+            "В сообщении не найдено премиум-эмодзи. Убедитесь, что вставили "
+            "эмодзи именно из вкладки Premium, и повторите /emoji_id."
+        )
+        return
+    lines = []
+    for e in found:
+        piece = (m.text or "")[e.offset:e.offset + e.length]
+        lines.append(f"{escape(piece)} → <code>{e.custom_emoji_id}</code>")
+    await m.answer("Найденные custom_emoji_id:\n\n" + "\n".join(lines), parse_mode="HTML")
 
 
 @admin_router.callback_query(F.data == "adm:menu")

@@ -96,21 +96,48 @@ class UserStates(StatesGroup):
     chat_message = State()
     withdrawal_amount = State()
 
+# Custom_emoji_id премиум-эмодзи для кнопок главного меню. Работает только
+# если владелец бота (аккаунт, на который выпущен BOT_TOKEN) имеет активную
+# подписку Telegram Premium — иначе Telegram просто покажет обычный текст
+# кнопки без иконки, ошибки не будет.
+#
+# Чтобы получить id нужного эмодзи: администратор пишет боту команду
+# /emoji_id, затем отправляет сообщение с этим эмодзи (вставленным именно
+# из вкладки Premium в панели эмодзи Telegram) — бот пришлёт его
+# custom_emoji_id. Впишите полученные значения ниже вместо None.
+MENU_EMOJI_IDS = {
+    "services": None,
+    "profile": None,
+    "executor": None,
+    "support": None,
+    "notifications": None,
+    "admin": None,
+}
+
 def menu(user_id=None, role=None):
     executor_button = (
-        InlineKeyboardButton(text="🧑‍💼 ЛК Исполнителя", callback_data="executor")
+        InlineKeyboardButton(
+            text="🧑‍💼 ЛК Исполнителя", callback_data="executor",
+            icon_custom_emoji_id=MENU_EMOJI_IDS["executor"])
         if role == "executor" else
-        InlineKeyboardButton(text="🧑‍💼 Стать исполнителем", callback_data="executor")
+        InlineKeyboardButton(
+            text="🧑‍💼 Стать исполнителем", callback_data="executor",
+            icon_custom_emoji_id=MENU_EMOJI_IDS["executor"])
     )
     kb = [
-        [InlineKeyboardButton(text="🛒 Услуги", callback_data="services"),
-         InlineKeyboardButton(text="👤 Профиль", callback_data="profile")],
+        [InlineKeyboardButton(text="🛒 Услуги", callback_data="services",
+                               icon_custom_emoji_id=MENU_EMOJI_IDS["services"]),
+         InlineKeyboardButton(text="👤 Профиль", callback_data="profile",
+                               icon_custom_emoji_id=MENU_EMOJI_IDS["profile"])],
         [executor_button,
-         InlineKeyboardButton(text="🆘 Поддержка", callback_data="support")],
+         InlineKeyboardButton(text="🆘 Поддержка", callback_data="support",
+                               icon_custom_emoji_id=MENU_EMOJI_IDS["support"])],
     ]
-    kb.append([InlineKeyboardButton(text="🔔 Уведомления", callback_data="notifications")])
+    kb.append([InlineKeyboardButton(text="🔔 Уведомления", callback_data="notifications",
+                                     icon_custom_emoji_id=MENU_EMOJI_IDS["notifications"])])
     if user_id in ADMIN_IDS:
-        kb.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="adm:menu")])
+        kb.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="adm:menu",
+                                         icon_custom_emoji_id=MENU_EMOJI_IDS["admin"])])
     return InlineKeyboardMarkup(inline_keyboard=kb)
 
 def back():
