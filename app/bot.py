@@ -43,6 +43,59 @@ START_BANNER_PATH = os.path.join(os.path.dirname(__file__), "assets", "start_ban
 SUPPORT_BANNER_PATH = os.path.join(os.path.dirname(__file__), "assets", "support_banner.png")
 AGREEMENT_URL = "https://telegra.ph/Polzovatelskoe-soglashenie-servisa-TornadoPay-09-09"
 
+# --- Обязательная подписка на канал ---
+# Чтобы включить проверку, задайте в переменных окружения:
+#   REQUIRED_CHANNEL_ID  — числовой ID канала (например, -1001234567890) или
+#                          username канала (например, @tornadopay_news).
+#                          Узнать числовой ID: переслать любое сообщение из
+#                          канала боту @userinfobot или @getmyid_bot.
+#   REQUIRED_CHANNEL_URL — ссылка для кнопки «Перейти в канал»
+#                          (например, https://t.me/tornadopay_news или
+#                          ссылка-приглашение для приватного канала).
+# Бот ОБЯЗАТЕЛЬНО должен быть добавлен в канал администратором
+# (достаточно прав "Добавление участников" не нужно, но без прав администратора
+# Telegram может не дать боту проверять подписчиков приватного канала).
+# Если переменная REQUIRED_CHANNEL_ID не задана — проверка подписки отключена
+# и бот работает как раньше.
+_raw_required_channel = os.getenv("REQUIRED_CHANNEL_ID", "").strip()
+if _raw_required_channel:
+    REQUIRED_CHANNEL_ID = int(_raw_required_channel) if _raw_required_channel.lstrip("-").isdigit() else _raw_required_channel
+else:
+    REQUIRED_CHANNEL_ID = None
+REQUIRED_CHANNEL_URL = os.getenv("REQUIRED_CHANNEL_URL", "").strip() or None
+
+
+async def is_subscribed(bot: Bot, user_id: int) -> bool:
+    """Проверяет подписку пользователя на обязательный канал.
+    Если REQUIRED_CHANNEL_ID не настроен — проверка не требуется.
+    Если Telegram вернул ошибку (бот не добавлен в канал, неверный ID и т.п.),
+    пользователей не блокируем, чтобы ошибка конфигурации не «положила» весь бот —
+    вместо этого ошибка попадает в лог сервера."""
+    if not REQUIRED_CHANNEL_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(REQUIRED_CHANNEL_ID, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception as e:
+        print(f"[Subscription check error] user={user_id}: {e}")
+        return True
+
+
+def subscription_kb():
+    rows = []
+    if REQUIRED_CHANNEL_URL:
+        rows.append([InlineKeyboardButton(text="📢 Перейти в канал", url=REQUIRED_CHANNEL_URL)])
+    rows.append([InlineKeyboardButton(text="✅ Я подписался, проверить", callback_data="check_subscription")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def subscription_text(prefix: str = "") -> str:
+    return (
+        f"{prefix}📢 <b>Обязательная подписка</b>\n\n"
+        "Чтобы пользоваться TornadoPay, подпишитесь на наш новостной канал, "
+        "а затем нажмите «✅ Я подписался, проверить»."
+    )
+
 
 def agreement_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
@@ -94,6 +147,50 @@ class AgreementMiddleware(BaseMiddleware):
 
 dp.message.outer_middleware(AgreementMiddleware())
 dp.callback_query.outer_middleware(AgreementMiddleware())
+
+
+class SubscriptionMiddleware(BaseMiddleware):
+    """Блокирует любые действия в боте, пока пользователь не подписан на
+    обязательный канал (если REQUIRED_CHANNEL_ID настроен). Пропускает
+    /start, кнопку принятия соглашения и кнопку проверки подписки —
+    иначе пользователь не сможет добраться до самой кнопки проверки."""
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        if not REQUIRED_CHANNEL_ID:
+            return await handler(event, data)
+
+        user = getattr(event, "from_user", None)
+        if user is None:
+            return await handler(event, data)
+
+        if isinstance(event, Message):
+            if event.text and event.text.split()[0].split("@")[0] == "/start":
+                return await handler(event, data)
+        elif isinstance(event, CallbackQuery):
+            if event.data in ("agree_tos", "check_subscription"):
+                return await handler(event, data)
+
+        if await is_subscribed(event.bot, user.id):
+            return await handler(event, data)
+
+        if isinstance(event, CallbackQuery):
+            await event.answer("Сначала подпишитесь на канал.", show_alert=True)
+            try:
+                await event.message.answer(subscription_text(), reply_markup=subscription_kb(), parse_mode="HTML")
+            except Exception:
+                pass
+        elif isinstance(event, Message):
+            await event.answer(subscription_text(), reply_markup=subscription_kb(), parse_mode="HTML")
+        return None
+
+
+dp.message.outer_middleware(SubscriptionMiddleware())
+dp.callback_query.outer_middleware(SubscriptionMiddleware())
 
 class UserStates(StatesGroup):
     waiting_order_amount = State()
@@ -272,6 +369,10 @@ async def start(m: Message):
             reply_markup=agreement_kb(), parse_mode="HTML")
         return
 
+    if not await is_subscribed(m.bot, m.from_user.id):
+        await m.answer(subscription_text(), reply_markup=subscription_kb(), parse_mode="HTML")
+        return
+
     user = await get_user(m.from_user.id)
     rate = get_exchange_rate()
     caption = (
@@ -290,6 +391,19 @@ async def start(m: Message):
 @dp.callback_query(F.data == "agree_tos")
 async def agree_tos(c: CallbackQuery):
     await accept_user_agreement(c.from_user.id)
+
+    if not await is_subscribed(c.bot, c.from_user.id):
+        try:
+            await c.message.edit_text(
+                subscription_text("✅ Спасибо! Условия пользовательского соглашения приняты.\n\n"),
+                reply_markup=subscription_kb(), parse_mode="HTML")
+        except Exception:
+            await c.message.answer(
+                subscription_text("✅ Спасибо! Условия пользовательского соглашения приняты.\n\n"),
+                reply_markup=subscription_kb(), parse_mode="HTML")
+        await c.answer()
+        return
+
     user = await get_user(c.from_user.id)
     rate = get_exchange_rate()
     caption = (
@@ -310,6 +424,33 @@ async def agree_tos(c: CallbackQuery):
         print(f"[start banner] {e}")
         await c.message.answer(caption, reply_markup=kb, parse_mode="HTML")
     await c.answer()
+
+@dp.callback_query(F.data == "check_subscription")
+async def check_subscription_cb(c: CallbackQuery):
+    if not await is_subscribed(c.bot, c.from_user.id):
+        await c.answer("Похоже, вы ещё не подписались. Подпишитесь и нажмите проверку ещё раз.", show_alert=True)
+        return
+
+    user = await get_user(c.from_user.id)
+    rate = get_exchange_rate()
+    caption = (
+        f"✅ Подписка подтверждена!\n\n"
+        f"👋 Добро пожаловать в <b>TornadoPay</b>!\n\n"
+        f"Маркетплейс услуг с оплатой в криптовалюте.\n"
+        f"Выберите услугу и укажите сумму в рублях.\n\n"
+        f"📊 Текущий курс: 1 USDT = {rate:.2f} RUB"
+    )
+    kb = menu(c.from_user.id, user[3] if user else None)
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
+    try:
+        await c.message.answer_photo(FSInputFile(START_BANNER_PATH), caption=caption, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        print(f"[start banner] {e}")
+        await c.message.answer(caption, reply_markup=kb, parse_mode="HTML")
+    await c.answer("Подписка подтверждена!")
 
 @dp.callback_query(F.data == "balance")
 async def balance(c: CallbackQuery):
