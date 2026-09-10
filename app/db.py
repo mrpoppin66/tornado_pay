@@ -17,7 +17,14 @@ if not DATABASE_URL:
     raise RuntimeError("DATABASE_URL is not set")
 
 pool: asyncpg.Pool | None = None
-current_exchange_rate: float = 100.0  # RUB per 1 USDT (default)
+current_exchange_rate: float = 100.0  # RUB per 1 USDT — курс, который реально используется в боте (со скидкой)
+raw_market_exchange_rate: float = 100.0  # RUB per 1 USDT — необработанный курс с CoinGecko, только для справки/логов
+
+# Скидка к реальному рыночному курсу USDT/RUB, применяемая в боте.
+# Пример: реальный курс 85 RUB/USDT, скидка 4.5% → в боте используется 85 * (1 - 0.045) = 81.175.
+# Такой курс делает 1 USDT «дешевле» в рублях, поэтому за тот же рублёвый эквивалент
+# клиент платит чуть больше USDT — в этом и есть маржа платформы.
+EXCHANGE_RATE_MARKUP_PERCENT: float = float(os.getenv("EXCHANGE_RATE_MARKUP_PERCENT", "4.5"))
 
 # Минимальная общая комиссия по любой услуге.
 # Если процентная комиссия меньше этого значения, применяется минимум,
@@ -54,8 +61,10 @@ def calculate_order_commission(user_amount_usdt, rate, owner_commission, executo
     return total_commission, owner_amount, executor_amount
 
 async def fetch_exchange_rate():
-    """Получить текущий курс USDT/RUB из CoinGecko"""
-    global current_exchange_rate
+    """Получить текущий реальный курс USDT/RUB из CoinGecko и применить
+    скидку платформы (EXCHANGE_RATE_MARKUP_PERCENT), чтобы получить курс,
+    который используется в расчётах и показывается пользователям."""
+    global current_exchange_rate, raw_market_exchange_rate
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(
@@ -65,8 +74,10 @@ async def fetch_exchange_rate():
                     data = await resp.json()
                     rate = data.get("tether", {}).get("rub")
                     if rate:
-                        current_exchange_rate = float(rate)
-                        print(f"[Exchange Rate] Updated: 1 USDT = {current_exchange_rate:.2f} RUB")
+                        raw_market_exchange_rate = float(rate)
+                        current_exchange_rate = raw_market_exchange_rate * (1 - EXCHANGE_RATE_MARKUP_PERCENT / 100.0)
+                        print(f"[Exchange Rate] Реальный курс: {raw_market_exchange_rate:.2f} RUB → "
+                              f"курс в боте (-{EXCHANGE_RATE_MARKUP_PERCENT:.2f}%): {current_exchange_rate:.2f} RUB")
     except Exception as e:
         print(f"[Exchange Rate Error] {e}")
 
@@ -81,8 +92,12 @@ async def start_exchange_rate_updater():
             await asyncio.sleep(300)
 
 def get_exchange_rate():
-    """Получить текущий курс"""
+    """Получить курс, который используется в боте (уже со скидкой платформы)."""
     return current_exchange_rate
+
+def get_raw_market_exchange_rate():
+    """Получить необработанный реальный рыночный курс (без скидки платформы), для справки/логов."""
+    return raw_market_exchange_rate
 
 async def _add_column_if_missing(conn, table: str, column: str, ddl: str):
     """Безопасная миграция: добавить колонку, если её ещё нет."""
