@@ -115,8 +115,8 @@ async def notify_new_executor_application(application_id, bot: Bot):
         return
     username = f"@{app[2]}" if app[2] else "—"
     text = (
-        f"🆕 <b>Новая заявка на роль исполнителя #{app[0]}</b>\\n\\n"
-        f"Пользователь: {username}\\n"
+        f"🆕 <b>Новая заявка на роль исполнителя #{app[0]}</b>\n\n"
+        f"Пользователь: {username}\n"
         f"ID: <code>{app[1]}</code>\n"
         f"Имя исполнителя: {escape(app[3] or '—')}\n\n"
         "Откройте раздел «Заявки на роль исполнителя» для просмотра и решения."
@@ -139,8 +139,8 @@ async def notify_executor_application_answer(application_id, bot: Bot):
     username = f"@{app[2]}" if app[2] else "—"
     text = (
         f"💬 <b>Исполнитель ответил по заявке #{app[0]}</b>\n\n"
-        f"Пользователь: {username}\\n"
-        f"ID: <code>{app[1]}</code>\n\\n"
+        f"Пользователь: {username}\n"
+        f"ID: <code>{app[1]}</code>\n\n"
         "Заявка снова ожидает решения администрации."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -490,21 +490,21 @@ def render_executor_application(app):
     status = EXECUTOR_APPLICATION_STATUSES.get(app[7], app[7])
     username = f"@{app[2]}" if app[2] else "—"
     text = (
-        f"🧑‍💼 <b>Заявка на роль исполнителя #{app[0]}</b>\\n\\n"
-        f"Пользователь: {username}\\n"
+        f"🧑‍💼 <b>Заявка на роль исполнителя #{app[0]}</b>\n\n"
+        f"Пользователь: {username}\n"
         f"ID: <code>{app[1]}</code>\n"
-        f"Имя исполнителя: {escape(app[3] or '—')}\\n"
-        f"Статус: <b>{status}</b>\\n\\n"
-        f"<b>Опыт:</b>\\n{escape(app[4] or '—')}\\n\\n"
-        f"<b>Какие услуги готов выполнять:</b>\\n{escape(app[5] or '—')}\\n\\n"
-        f"<b>Комментарий:</b>\\n{escape(app[6] or '—')}"
+        f"Имя исполнителя: {escape(app[3] or '—')}\n"
+        f"Статус: <b>{status}</b>\n\n"
+        f"<b>Опыт:</b>\n{escape(app[4] or '—')}\n\n"
+        f"<b>Какие услуги готов выполнять:</b>\n{escape(app[5] or '—')}\n\n"
+        f"<b>Комментарий:</b>\n{escape(app[6] or '—')}"
     )
     if app[8]:
-        text += f"\\n\\n<b>Вопрос администрации:</b>\\n{escape(app[8])}"
+        text += f"\n\n<b>Вопрос администрации:</b>\n{escape(app[8])}"
     if app[9]:
-        text += f"\\n\\n<b>Ответ исполнителя:</b>\\n{escape(app[9])}"
+        text += f"\n\n<b>Ответ исполнителя:</b>\n{escape(app[9])}"
     if app[10]:
-        text += f"\\n\\n<b>Причина отказа:</b>\\n{escape(app[10])}"
+        text += f"\n\n<b>Причина отказа:</b>\n{escape(app[10])}"
 
     kb_rows = []
     if app[7] in ("pending", "question"):
@@ -524,7 +524,7 @@ def render_executor_application(app):
 async def admin_executor_applications_default(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await c.message.edit_text(
-        "🧑‍💼 <b>Заявки на роль исполнителя</b>\\n\\nВыберите статус:",
+        "🧑‍💼 <b>Заявки на роль исполнителя</b>\n\nВыберите статус:",
         reply_markup=executor_applications_kb("pending"), parse_mode="HTML")
     await c.answer()
 
@@ -534,14 +534,14 @@ async def admin_executor_applications(c: CallbackQuery, state: FSMContext):
     await state.clear()
     status = c.data.split(":")[2]
     rows = await list_executor_applications(None if status == "all" else status, limit=500)
-    text = "🧑‍💼 <b>Заявки на роль исполнителя</b>\\n\\n"
+    text = "🧑‍💼 <b>Заявки на роль исполнителя</b>\n\n"
     if not rows:
         text += "Заявок нет."
     else:
         for r in rows:
             username = f"@{r[2]}" if r[2] else str(r[1])
             label = EXECUTOR_APPLICATION_STATUSES.get(r[3], r[3])
-            text += f"#{r[0]} — {username} — {label}\\n"
+            text += f"#{r[0]} — {username} — {label}\n"
     kb = executor_applications_kb(status if status != "all" else "pending")
     # Кнопка на каждую заявку отдельной строкой, чтобы можно было открыть полный профиль.
     if rows:
@@ -583,7 +583,7 @@ async def admin_executor_application_approve(c: CallbackQuery):
         await c.answer("Заявка уже обработана.", show_alert=True)
         return
     try:
-        await c.bot.send_message(user_id, "✅ <b>Ваша заявка на роль исполнителя одобрена!</b>\\n\\nТеперь вам доступен личный кабинет исполнителя.", parse_mode="HTML")
+        await c.bot.send_message(user_id, "✅ <b>Ваша заявка на роль исполнителя одобрена!</b>\n\nТеперь вам доступен личный кабинет исполнителя.", parse_mode="HTML")
     except Exception as e:
         print(f"[Executor approval notify] {user_id}: {e}")
     await c.answer("Заявка одобрена.")
@@ -604,7 +604,7 @@ async def admin_executor_application_reject(c: CallbackQuery):
         await c.answer("Заявка уже обработана.", show_alert=True)
         return
     try:
-        await c.bot.send_message(user_id, "❌ <b>Ваша заявка на роль исполнителя отклонена.</b>\\n\\nПричина: Отклонено администрацией.", parse_mode="HTML")
+        await c.bot.send_message(user_id, "❌ <b>Ваша заявка на роль исполнителя отклонена.</b>\n\nПричина: Отклонено администрацией.", parse_mode="HTML")
     except Exception as e:
         print(f"[Executor rejection notify] {user_id}: {e}")
     await c.answer("Заявка отклонена.")
@@ -644,14 +644,14 @@ async def admin_executor_application_question_finish(m: Message, state: FSMConte
     try:
         await m.bot.send_message(
             app[1],
-            f"💬 <b>Вопрос администрации по вашей заявке</b>\\n\\n{escape(question)}",
+            f"💬 <b>Вопрос администрации по вашей заявке</b>\n\n{escape(question)}",
             parse_mode="HTML"
         )
     except Exception as e:
         print(f"[Executor question notify] {app[1]}: {e}")
     updated = await get_executor_application(app_id)
     text, kb = render_executor_application(updated)
-    await m.answer("✅ Вопрос отправлен исполнителю.\\n\\n" + text, reply_markup=kb, parse_mode="HTML")
+    await m.answer("✅ Вопрос отправлен исполнителю.\n\n" + text, reply_markup=kb, parse_mode="HTML")
 
 
 # ---------- Управление исполнителями ----------
