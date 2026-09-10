@@ -93,6 +93,7 @@ def parse_positive_number(text):
 def admin_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Заявки", callback_data="adm:orders:new")],
+        [InlineKeyboardButton(text="🧑‍💼 Заявки на роль исполнителя", callback_data="adm:execapps")],
         [InlineKeyboardButton(text="⚖️ Споры", callback_data="adm:disputes")],
         [InlineKeyboardButton(text="🧑‍💼 Исполнители", callback_data="adm:executors")],
         [InlineKeyboardButton(text="🛒 Услуги", callback_data="adm:services")],
@@ -106,6 +107,51 @@ def admin_back_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")]
     ])
+
+async def notify_new_executor_application(application_id, bot: Bot):
+    """Отправляет отдельное уведомление каждому администратору о новой заявке."""
+    app = await get_executor_application(application_id)
+    if not app:
+        return
+    username = f"@{app[2]}" if app[2] else "—"
+    text = (
+        f"🆕 <b>Новая заявка на роль исполнителя #{app[0]}</b>\\n\\n"
+        f"Пользователь: {username}\\n"
+        f"ID: <code>{app[1]}</code>\\n"
+        f"Имя исполнителя: {escape(app[3] or '—')}\\n\\n"
+        "Откройте раздел «Заявки на роль исполнителя» для просмотра и решения."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Открыть заявку", callback_data=f"adm:execapp:{app[0]}")]
+    ])
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            print(f"[notify_new_executor_application] {admin_id}: {e}")
+
+
+async def notify_executor_application_answer(application_id, bot: Bot):
+    """Уведомляет администраторов, когда исполнитель ответил на вопрос."""
+    app = await get_executor_application(application_id)
+    if not app:
+        return
+    username = f"@{app[2]}" if app[2] else "—"
+    text = (
+        f"💬 <b>Исполнитель ответил по заявке #{app[0]}</b>\\n\\n"
+        f"Пользователь: {username}\\n"
+        f"ID: <code>{app[1]}</code>\\n\\n"
+        "Заявка снова ожидает решения администрации."
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 Открыть заявку", callback_data=f"adm:execapp:{app[0]}")]
+    ])
+    for admin_id in ADMIN_IDS:
+        try:
+            await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            print(f"[notify_executor_application_answer] {admin_id}: {e}")
+
 
 
 def user_profile_kb(user_id, is_executor, blocked):
@@ -417,6 +463,196 @@ async def admin_settle(c: CallbackQuery):
     if o:
         text, kb = render_order_detail(o)
         await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+# ---------- Заявки на роль исполнителя ----------
+
+EXEC_APP_TABS = [
+    ("pending", "⏳ На рассмотрении"),
+    ("question", "💬 Ждут ответа"),
+    ("approved", "✅ Одобрены"),
+    ("rejected", "❌ Отклонены"),
+    ("blocked", "🚫 Заблокированы"),
+]
+
+def executor_applications_kb(active_status="pending"):
+    rows = []
+    for status, label in EXEC_APP_TABS:
+        rows.append([InlineKeyboardButton(
+            text=("• " if status == active_status else "") + label,
+            callback_data=f"adm:execapps:{status}"
+        )])
+    rows.append([InlineKeyboardButton(text="📚 Все заявки", callback_data="adm:execapps:all")])
+    rows.append([InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def render_executor_application(app):
+    status = EXECUTOR_APPLICATION_STATUSES.get(app[7], app[7])
+    username = f"@{app[2]}" if app[2] else "—"
+    text = (
+        f"🧑‍💼 <b>Заявка на роль исполнителя #{app[0]}</b>\\n\\n"
+        f"Пользователь: {username}\\n"
+        f"ID: <code>{app[1]}</code>\\n"
+        f"Имя исполнителя: {escape(app[3] or '—')}\\n"
+        f"Статус: <b>{status}</b>\\n\\n"
+        f"<b>Опыт:</b>\\n{escape(app[4] or '—')}\\n\\n"
+        f"<b>Какие услуги готов выполнять:</b>\\n{escape(app[5] or '—')}\\n\\n"
+        f"<b>Комментарий:</b>\\n{escape(app[6] or '—')}"
+    )
+    if app[8]:
+        text += f"\\n\\n<b>Вопрос администрации:</b>\\n{escape(app[8])}"
+    if app[9]:
+        text += f"\\n\\n<b>Ответ исполнителя:</b>\\n{escape(app[9])}"
+    if app[10]:
+        text += f"\\n\\n<b>Причина отказа:</b>\\n{escape(app[10])}"
+
+    kb_rows = []
+    if app[7] in ("pending", "question"):
+        kb_rows.append([
+            InlineKeyboardButton(text="✅ Принять", callback_data=f"adm:execapp:approve:{app[0]}"),
+            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"adm:execapp:reject:{app[0]}"),
+        ])
+    if app[7] in ("pending", "question"):
+        kb_rows.append([InlineKeyboardButton(
+            text="💬 Задать вопрос", callback_data=f"adm:execapp:question:{app[0]}"
+        )])
+    kb_rows.append([InlineKeyboardButton(text="⬅️ К списку заявок", callback_data=f"adm:execapps:{'pending' if app[7] in ('pending','question') else 'all'}")])
+    return text, InlineKeyboardMarkup(inline_keyboard=kb_rows)
+
+
+@admin_router.callback_query(F.data == "adm:execapps")
+async def admin_executor_applications_default(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await c.message.edit_text(
+        "🧑‍💼 <b>Заявки на роль исполнителя</b>\\n\\nВыберите статус:",
+        reply_markup=executor_applications_kb("pending"), parse_mode="HTML")
+    await c.answer()
+
+
+@admin_router.callback_query(F.data.startswith("adm:execapps:"))
+async def admin_executor_applications(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    status = c.data.split(":")[2]
+    rows = await list_executor_applications(None if status == "all" else status, limit=500)
+    text = "🧑‍💼 <b>Заявки на роль исполнителя</b>\\n\\n"
+    if not rows:
+        text += "Заявок нет."
+    else:
+        for r in rows:
+            username = f"@{r[2]}" if r[2] else str(r[1])
+            label = EXECUTOR_APPLICATION_STATUSES.get(r[3], r[3])
+            text += f"#{r[0]} — {username} — {label}\\n"
+    kb = executor_applications_kb(status if status != "all" else "pending")
+    # Кнопка на каждую заявку отдельной строкой, чтобы можно было открыть полный профиль.
+    if rows:
+        # Telegram ограничивает размер callback_data, но ID заявки короткий.
+        # Добавляем кнопки после списка статусов.
+        base = kb.inline_keyboard[:-1]
+        for r in rows:
+            username = f"@{r[2]}" if r[2] else str(r[1])
+            label = EXECUTOR_APPLICATION_STATUSES.get(r[3], r[3])
+            base.append([InlineKeyboardButton(text=f"#{r[0]} · {username} · {label}", callback_data=f"adm:execapp:{r[0]}")])
+        base.append(kb.inline_keyboard[-1])
+        kb = InlineKeyboardMarkup(inline_keyboard=base)
+    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await c.answer()
+
+
+@admin_router.callback_query(F.data.regexp(r"^adm:execapp:\\d+$"))
+async def admin_executor_application_detail(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    app_id = int(c.data.split(":")[2])
+    app = await get_executor_application(app_id)
+    if not app:
+        await c.answer("Заявка не найдена.", show_alert=True)
+        return
+    text, kb = render_executor_application(app)
+    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await c.answer()
+
+
+@admin_router.callback_query(F.data.startswith("adm:execapp:approve:"))
+async def admin_executor_application_approve(c: CallbackQuery):
+    app_id = int(c.data.split(":")[3])
+    app = await get_executor_application(app_id)
+    if not app:
+        await c.answer("Заявка не найдена.", show_alert=True)
+        return
+    user_id = await approve_executor_application(app_id)
+    if not user_id:
+        await c.answer("Заявка уже обработана.", show_alert=True)
+        return
+    try:
+        await c.bot.send_message(user_id, "✅ <b>Ваша заявка на роль исполнителя одобрена!</b>\\n\\nТеперь вам доступен личный кабинет исполнителя.", parse_mode="HTML")
+    except Exception as e:
+        print(f"[Executor approval notify] {user_id}: {e}")
+    await c.answer("Заявка одобрена.")
+    updated = await get_executor_application(app_id)
+    text, kb = render_executor_application(updated)
+    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data.startswith("adm:execapp:reject:"))
+async def admin_executor_application_reject(c: CallbackQuery):
+    app_id = int(c.data.split(":")[3])
+    app = await get_executor_application(app_id)
+    if not app:
+        await c.answer("Заявка не найдена.", show_alert=True)
+        return
+    user_id = await reject_executor_application(app_id, "Отклонено администрацией")
+    if not user_id:
+        await c.answer("Заявка уже обработана.", show_alert=True)
+        return
+    try:
+        await c.bot.send_message(user_id, "❌ <b>Ваша заявка на роль исполнителя отклонена.</b>\\n\\nПричина: Отклонено администрацией.", parse_mode="HTML")
+    except Exception as e:
+        print(f"[Executor rejection notify] {user_id}: {e}")
+    await c.answer("Заявка отклонена.")
+    updated = await get_executor_application(app_id)
+    text, kb = render_executor_application(updated)
+    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data.startswith("adm:execapp:question:"))
+async def admin_executor_application_question_start(c: CallbackQuery, state: FSMContext):
+    app_id = int(c.data.split(":")[3])
+    app = await get_executor_application(app_id)
+    if not app or app[7] not in ("pending", "question"):
+        await c.answer("Заявка уже обработана.", show_alert=True)
+        return
+    await state.update_data(executor_application_id=app_id)
+    await state.set_state(AdminStates.waiting_executor_question)
+    await c.message.edit_text("💬 Напишите вопрос исполнителю:", reply_markup=admin_back_kb())
+    await c.answer()
+
+
+@admin_router.message(AdminStates.waiting_executor_question)
+async def admin_executor_application_question_finish(m: Message, state: FSMContext):
+    question = (m.text or "").strip()
+    if not question:
+        await m.answer("Вопрос не может быть пустым.")
+        return
+    data = await state.get_data()
+    app_id = int(data["executor_application_id"])
+    app = await get_executor_application(app_id)
+    if not app or app[7] not in ("pending", "question"):
+        await state.clear()
+        await m.answer("Заявка уже обработана.", reply_markup=admin_back_kb())
+        return
+    await set_executor_application_question(app_id, question)
+    await state.clear()
+    try:
+        await m.bot.send_message(
+            app[1],
+            f"💬 <b>Вопрос администрации по вашей заявке</b>\\n\\n{escape(question)}",
+            parse_mode="HTML"
+        )
+    except Exception as e:
+        print(f"[Executor question notify] {app[1]}: {e}")
+    updated = await get_executor_application(app_id)
+    text, kb = render_executor_application(updated)
+    await m.answer("✅ Вопрос отправлен исполнителю.\\n\\n" + text, reply_markup=kb, parse_mode="HTML")
+
 
 # ---------- Управление исполнителями ----------
 
