@@ -148,7 +148,8 @@ async def init_db():
             escrow_amount_usdt NUMERIC(18,4) NOT NULL DEFAULT 0,
             payment_method TEXT,
             payment_details TEXT,
-            payment_file_id TEXT
+            payment_file_id TEXT,
+            order_comment TEXT
         );
         CREATE TABLE IF NOT EXISTS executor_applications(
             id SERIAL PRIMARY KEY,
@@ -283,6 +284,7 @@ async def init_db():
         await _add_column_if_missing(conn, "orders", "payment_method", "TEXT")
         await _add_column_if_missing(conn, "orders", "payment_details", "TEXT")
         await _add_column_if_missing(conn, "orders", "payment_file_id", "TEXT")
+        await _add_column_if_missing(conn, "orders", "order_comment", "TEXT NOT NULL DEFAULT ''")
         # V18: «Карта под оплату» хранит безопасную метку отдельно,
         # а полные реквизиты карты — только в зашифрованном виде.
         # CVV/CVC и OTP/СМС-коды бот не запрашивает и не сохраняет.
@@ -368,7 +370,7 @@ async def get_service(service_id):
             service_id,
         )
 
-async def create_order(user_id, service_id, amount_rub, rate=None, payment_method=None, payment_details=None, payment_file_id=None):
+async def create_order(user_id, service_id, amount_rub, rate=None, payment_method=None, payment_details=None, payment_file_id=None, order_comment=""):
     """Create an order and reserve the full client payment in escrow."""
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -397,10 +399,10 @@ async def create_order(user_id, service_id, amount_rub, rate=None, payment_metho
             order_id = await conn.fetchval(
                 """INSERT INTO orders(user_id, service_id, amount_rub, exchange_rate, user_amount_usdt,
                     total_amount_usdt, owner_commission_amount, executor_commission_amount, escrow_amount_usdt,
-                    payment_method, payment_details, payment_file_id)
-                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$6,$9,$10,$11) RETURNING id""",
+                    payment_method, payment_details, payment_file_id, order_comment)
+                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$6,$9,$10,$11,$12) RETURNING id""",
                 user_id, service_id, amount_rub, rate, user_amount_usdt, total_amount_usdt, owner_amount, executor_amount,
-                payment_method, payment_details, payment_file_id)
+                payment_method, payment_details, payment_file_id, (order_comment or "")[:1000])
             await conn.execute("UPDATE users SET balance=balance-$1 WHERE user_id=$2", total_amount_usdt, user_id)
             await conn.execute("INSERT INTO transactions(user_id,order_id,amount,type,description) VALUES($1,$2,$3,'escrow_hold',$4)", user_id, order_id, -total_amount_usdt, f"Резерв по заявке #{order_id}")
             return order_id, "ok"
@@ -408,7 +410,7 @@ async def create_order(user_id, service_id, amount_rub, rate=None, payment_metho
 async def get_orders(user_id):
     async with pool.acquire() as conn:
         return await conn.fetch(
-            """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt, o.status, o.executor_id, o.created_at
+            """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt, o.status, o.executor_id, o.created_at, o.order_comment
                FROM orders o JOIN services s ON s.id = o.service_id
                WHERE o.user_id = $1 ORDER BY o.id DESC LIMIT 20""",
             user_id,
@@ -468,7 +470,7 @@ async def get_free_orders(limit=20):
     async with pool.acquire() as conn:
         return await conn.fetch(
             """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt,
-                      o.executor_commission_amount, o.created_at
+                      o.executor_commission_amount, o.created_at, o.order_comment
                FROM orders o
                JOIN services s ON s.id = o.service_id
                WHERE o.status='new' AND o.executor_id IS NULL
@@ -518,11 +520,9 @@ def _get_card_cipher():
     return Fernet(key.encode())
 
 async def set_executor_card_details(order_id, executor_id, card_number, expiry, cardholder):
-    """Сохранить реквизиты карты исполнителя.
+    """Устаревшая функция V18. Новая версия не сохраняет данные карты.
 
-    Полные данные шифруются Fernet перед записью в БД. В открытом виде
-    сохраняется только метка «Карта •••• 1234». CVV/CVC и OTP/СМС-коды
-    намеренно не принимаются и не сохраняются.
+    Оставлена только для совместимости со старым кодом/данными.
     """
     card_number = re.sub(r"\D", "", card_number or "")
     expiry = (expiry or "").strip()
@@ -651,7 +651,7 @@ async def get_executor_active_order(executor_id):
         return await conn.fetchrow(
             """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
                       o.executor_commission_amount, o.status, o.created_at, o.completed_at, o.disputed_at,
-                      o.settlement_for, o.user_id, o.payment_method, o.payment_details, o.payment_file_id
+                      o.settlement_for, o.user_id, o.payment_method, o.payment_details, o.payment_file_id, o.order_comment
                FROM orders o JOIN services s ON s.id=o.service_id
                WHERE o.executor_id=$1 AND o.status IN ('in_progress','awaiting_confirmation','disputed')
                ORDER BY o.id DESC LIMIT 1""", executor_id
@@ -964,7 +964,7 @@ async def get_orders_by_status(status, limit=15):
         return await conn.fetch(
             """SELECT o.id, o.user_id, u.username, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
                       o.owner_commission_amount, o.executor_commission_amount, o.status,
-                      o.executor_id, o.created_at, o.payment_method, o.payment_details, o.payment_file_id
+                      o.executor_id, o.created_at, o.payment_method, o.payment_details, o.payment_file_id, o.order_comment
                FROM orders o
                JOIN services s ON s.id = o.service_id
                JOIN users u ON u.user_id = o.user_id
@@ -978,7 +978,7 @@ async def get_order(order_id):
         return await conn.fetchrow(
             """SELECT o.id, o.user_id, u.username, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
                       o.owner_commission_amount, o.executor_commission_amount, o.status,
-                      o.executor_id, o.created_at
+                      o.executor_id, o.created_at, o.payment_method, o.payment_details, o.payment_file_id, o.order_comment
                FROM orders o
                JOIN services s ON s.id = o.service_id
                JOIN users u ON u.user_id = o.user_id

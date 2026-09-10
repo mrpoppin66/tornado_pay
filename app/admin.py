@@ -267,6 +267,8 @@ def render_order_detail(o):
     if o[9] == "disputed":
         buttons.append([InlineKeyboardButton(text="👷 В пользу исполнителя", callback_data=f"adm:settle:{o[0]}:executor")])
         buttons.append([InlineKeyboardButton(text="👤 Вернуть клиенту", callback_data=f"adm:settle:{o[0]}:client")])
+    if o[9] in ("in_progress", "awaiting_confirmation", "disputed") and o[10]:
+        buttons.append([InlineKeyboardButton(text="💬 История чата", callback_data=f"adm:chat:{o[0]}")])
     if o[9] in ("new", "in_progress"):
         buttons.append([InlineKeyboardButton(text="❌ Отменить", callback_data=f"adm:ordstatus:{o[0]}:cancelled")])
         buttons.append([InlineKeyboardButton(text="👷 Назначить исполнителя", callback_data=f"adm:ordexec:{o[0]}")])
@@ -283,6 +285,51 @@ async def admin_order_detail(c: CallbackQuery, state: FSMContext):
         await c.answer("Заявка не найдена", show_alert=True)
         return
     text, kb = render_order_detail(o)
+    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await c.answer()
+
+
+@admin_router.callback_query(F.data.startswith("adm:chat:"))
+async def admin_chat_history(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    order_id = int(c.data.split(":")[2])
+    o = await get_order(order_id)
+    if not o or o[9] not in ("in_progress", "awaiting_confirmation", "disputed") or not o[10]:
+        await c.answer("История чата недоступна.", show_alert=True)
+        return
+
+    rows = await get_recent_chat_messages(order_id, 50)
+    rows = list(reversed(rows))
+    lines = [f"💬 <b>История чата по заявке #{order_id}</b>", ""]
+    if not rows:
+        lines.append("Сообщений пока нет.")
+    else:
+        for r in rows:
+            sender_id, content_type, text_content, created_at = r[1], r[2], r[3], r[4]
+            if sender_id == o[1]:
+                who = "👤 Клиент"
+            elif sender_id == o[10]:
+                who = "🧑‍💼 Исполнитель"
+            else:
+                who = f"ID {sender_id}"
+            stamp = created_at.strftime("%d.%m.%Y %H:%M") if created_at else ""
+            if content_type == "text":
+                body = escape(text_content or "")[:1200]
+            else:
+                body = f"[{escape(content_type)}]"
+                if text_content:
+                    body += f" {escape(text_content[:500])}"
+            lines.append(f"<b>{who}</b> <i>{stamp}</i>:\n{body}")
+
+    if len(lines) > 45:
+        # Telegram has a message-size limit; keep the most recent part in the admin view.
+        lines = lines[:2] + ["⚠️ Показаны последние сообщения из истории.", ""] + lines[-42:]
+    text = "\n\n".join(lines)
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📋 К заявке", callback_data=f"adm:order:{order_id}")],
+        [InlineKeyboardButton(text="⚖️ Открыть спор", callback_data=f"adm:order:{order_id}")],
+    ])
+    # For an already disputed order, the order card contains the verdict buttons.
     await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
     await c.answer()
 
