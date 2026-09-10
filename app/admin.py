@@ -382,6 +382,16 @@ async def admin_settle(c: CallbackQuery):
             try:
                 await c.bot.send_message(executor_id, f"🎉 <b>Заявка #{order_id} завершена администрацией</b>\n\nВам начислено <b>{payout:.4f} USDT</b>.", parse_mode="HTML")
             except Exception as e: print(f"[Admin payout notify] {e}")
+            o_full = await get_order(order_id)
+            if o_full:
+                from .bot import rating_kb
+                try:
+                    await c.bot.send_message(
+                        o_full[1],
+                        f"⚖️ <b>По заявке #{order_id} решение администрации: в пользу исполнителя.</b>\n\n"
+                        "⭐ Оцените работу исполнителя от 1 до 5 звёзд:",
+                        reply_markup=rating_kb(order_id), parse_mode="HTML")
+                except Exception as e: print(f"[Admin rating prompt] {e}")
     elif action == "client":
         result = await refund_order_client(order_id)
         msg = "Средства возвращены клиенту." if result else "Заявка уже обработана или не находится в споре."

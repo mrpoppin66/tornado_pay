@@ -183,6 +183,7 @@ async def init_db():
             comment TEXT,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_ratings_order_from ON ratings(order_id, from_user_id);
         CREATE TABLE IF NOT EXISTS order_chat_messages(
             id BIGSERIAL PRIMARY KEY,
             order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE,
@@ -879,13 +880,51 @@ async def add_rating(order_id, from_user_id, to_user_id, stars, comment=""):
             order_id, from_user_id, to_user_id, stars, comment
         )
 
-async def has_rating(order_id):
-    """Проверить, есть ли уже оценка для этой заявки"""
+async def has_rating(order_id, from_user_id=None):
+    """Проверить, есть ли уже оценка для этой заявки (опционально — от конкретного автора)."""
     async with pool.acquire() as conn:
-        return await conn.fetchval(
-            "SELECT COUNT(*) FROM ratings WHERE order_id=$1",
-            order_id
-        )
+        if from_user_id is not None:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM ratings WHERE order_id=$1 AND from_user_id=$2",
+                order_id, from_user_id
+            )
+        else:
+            count = await conn.fetchval(
+                "SELECT COUNT(*) FROM ratings WHERE order_id=$1",
+                order_id
+            )
+        return bool(count)
+
+async def submit_order_rating(order_id, client_id, stars):
+    """Атомарно зафиксировать оценку клиента исполнителю по завершённой заявке.
+
+    Возвращает (executor_id, ok_flag, reason). reason — код причины отказа:
+    'not_found' | 'not_owner' | 'no_executor' | 'not_done' | 'already_rated'.
+    """
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT user_id, executor_id, status FROM orders WHERE id=$1 FOR UPDATE", order_id
+            )
+            if not row:
+                return None, False, 'not_found'
+            if row[0] != client_id:
+                return None, False, 'not_owner'
+            if not row[1]:
+                return None, False, 'no_executor'
+            if row[2] != 'done':
+                return None, False, 'not_done'
+            already = await conn.fetchval(
+                "SELECT COUNT(*) FROM ratings WHERE order_id=$1 AND from_user_id=$2", order_id, client_id
+            )
+            if already:
+                return row[1], False, 'already_rated'
+            await conn.execute(
+                """INSERT INTO ratings(order_id, from_user_id, to_user_id, stars)
+                   VALUES($1, $2, $3, $4)""",
+                order_id, client_id, row[1], stars
+            )
+            return row[1], True, 'ok'
 
 # ---------- Анонимный чат по заявке ----------
 

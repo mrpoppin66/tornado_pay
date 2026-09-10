@@ -26,6 +26,7 @@ from .db import (
     get_order_events, get_order_evidence, set_user_blocked, get_executor_profile, get_executor_history_detailed, get_user_blocked,
     get_user_agreement_accepted, accept_user_agreement,
     create_deposit, get_deposit_by_invoice, mark_deposit_paid, mark_deposit_expired,
+    submit_order_rating,
 )
 from . import xrocket
 from .admin import admin_router, ADMIN_IDS
@@ -1197,6 +1198,12 @@ async def executor_done(c: CallbackQuery):
     await c.answer("Заявка отмечена выполненной.",show_alert=True)
     await executor_active(c)
 
+def rating_kb(order_id):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"{n}⭐", callback_data=f"rate:{order_id}:{n}") for n in range(1, 6)],
+        [InlineKeyboardButton(text="Пропустить", callback_data=f"rate:skip:{order_id}")],
+    ])
+
 @dp.callback_query(F.data.startswith("order:confirm:"))
 async def client_confirm_order(c: CallbackQuery):
     order_id=int(c.data.split(":")[2])
@@ -1209,8 +1216,44 @@ async def client_confirm_order(c: CallbackQuery):
     try:
         await c.bot.send_message(executor_id, f"🎉 <b>Заявка #{order_id} подтверждена клиентом.</b>\n\nСредства за заявку зачислены на ваш баланс.", parse_mode="HTML")
     except Exception as e: print(f"[Notify confirm] {e}")
-    await c.message.edit_text(f"✅ <b>Заявка #{order_id} завершена.</b>\n\nВыполнение подтверждено.",reply_markup=back(),parse_mode="HTML")
+    await c.message.edit_text(
+        f"✅ <b>Заявка #{order_id} завершена.</b>\n\nВыполнение подтверждено.\n\n"
+        "⭐ Оцените работу исполнителя от 1 до 5 звёзд:",
+        reply_markup=rating_kb(order_id), parse_mode="HTML")
     await c.answer("Заявка завершена")
+
+@dp.callback_query(F.data.startswith("rate:skip:"))
+async def order_rating_skip(c: CallbackQuery):
+    order_id = int(c.data.split(":")[2])
+    await c.message.edit_text(f"✅ <b>Заявка #{order_id} завершена.</b>\n\nВыполнение подтверждено.", reply_markup=back(), parse_mode="HTML")
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("rate:"))
+async def order_rating_submit(c: CallbackQuery):
+    parts = c.data.split(":")
+    order_id = int(parts[1])
+    stars = int(parts[2])
+    executor_id, ok, reason = await submit_order_rating(order_id, c.from_user.id, stars)
+    if not ok:
+        msgs = {
+            'not_found': 'Заявка не найдена.',
+            'not_owner': 'Это не ваша заявка.',
+            'no_executor': 'У заявки нет исполнителя.',
+            'not_done': 'Оценить можно только завершённую заявку.',
+            'already_rated': 'Вы уже оценили эту заявку.',
+        }
+        await c.answer(msgs.get(reason, 'Не удалось сохранить оценку.'), show_alert=True)
+        if reason == 'already_rated':
+            await c.message.edit_text(f"✅ <b>Заявка #{order_id} завершена.</b>\n\nВы уже оставили оценку. Спасибо!", reply_markup=back(), parse_mode="HTML")
+        return
+    await log_order_event(order_id, c.from_user.id, "rated", f"Клиент поставил оценку {stars}⭐")
+    try:
+        await c.bot.send_message(executor_id, f"⭐ <b>Заявка #{order_id} оценена клиентом:</b> {stars}⭐", parse_mode="HTML")
+    except Exception as e: print(f"[Notify rating] {e}")
+    await c.message.edit_text(
+        f"✅ <b>Заявка #{order_id} завершена.</b>\n\nСпасибо за оценку: {'⭐'*stars}",
+        reply_markup=back(), parse_mode="HTML")
+    await c.answer("Спасибо за оценку!")
 
 @dp.callback_query(F.data.startswith("order:dispute:"))
 async def client_dispute_order(c: CallbackQuery):
