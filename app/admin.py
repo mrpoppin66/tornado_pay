@@ -117,8 +117,8 @@ async def notify_new_executor_application(application_id, bot: Bot):
     text = (
         f"🆕 <b>Новая заявка на роль исполнителя #{app[0]}</b>\\n\\n"
         f"Пользователь: {username}\\n"
-        f"ID: <code>{app[1]}</code>\\n"
-        f"Имя исполнителя: {escape(app[3] or '—')}\\n\\n"
+        f"ID: <code>{app[1]}</code>\n"
+        f"Имя исполнителя: {escape(app[3] or '—')}\n\n"
         "Откройте раздел «Заявки на роль исполнителя» для просмотра и решения."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -138,9 +138,9 @@ async def notify_executor_application_answer(application_id, bot: Bot):
         return
     username = f"@{app[2]}" if app[2] else "—"
     text = (
-        f"💬 <b>Исполнитель ответил по заявке #{app[0]}</b>\\n\\n"
+        f"💬 <b>Исполнитель ответил по заявке #{app[0]}</b>\n\n"
         f"Пользователь: {username}\\n"
-        f"ID: <code>{app[1]}</code>\\n\\n"
+        f"ID: <code>{app[1]}</code>\n\\n"
         "Заявка снова ожидает решения администрации."
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -492,7 +492,7 @@ def render_executor_application(app):
     text = (
         f"🧑‍💼 <b>Заявка на роль исполнителя #{app[0]}</b>\\n\\n"
         f"Пользователь: {username}\\n"
-        f"ID: <code>{app[1]}</code>\\n"
+        f"ID: <code>{app[1]}</code>\n"
         f"Имя исполнителя: {escape(app[3] or '—')}\\n"
         f"Статус: <b>{status}</b>\\n\\n"
         f"<b>Опыт:</b>\\n{escape(app[4] or '—')}\\n\\n"
@@ -558,7 +558,7 @@ async def admin_executor_applications(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 
-@admin_router.callback_query(F.data.regexp(r"^adm:execapp:\\d+$"))
+@admin_router.callback_query(F.data.regexp(r"^adm:execapp:\d+$"))
 async def admin_executor_application_detail(c: CallbackQuery, state: FSMContext):
     await state.clear()
     app_id = int(c.data.split(":")[2])
