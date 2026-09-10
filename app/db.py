@@ -111,6 +111,7 @@ async def init_db():
             executor_description TEXT,
             executor_city TEXT,
             executor_available BOOLEAN NOT NULL DEFAULT FALSE,
+            executor_notify_enabled BOOLEAN NOT NULL DEFAULT TRUE,
             executor_blocked BOOLEAN NOT NULL DEFAULT FALSE,
             blocked BOOLEAN NOT NULL DEFAULT FALSE,
             block_reason TEXT,
@@ -260,6 +261,7 @@ async def init_db():
         await _add_column_if_missing(conn, "users", "executor_description", "TEXT")
         await _add_column_if_missing(conn, "users", "executor_city", "TEXT")
         await _add_column_if_missing(conn, "users", "executor_available", "BOOLEAN NOT NULL DEFAULT FALSE")
+        await _add_column_if_missing(conn, "users", "executor_notify_enabled", "BOOLEAN NOT NULL DEFAULT TRUE")
         # Старые версии использовали wallet для ручного вывода. Адреса больше не собираем:
         # оставляем колонку только для обратной совместимости, но делаем её необязательной.
         await conn.execute("ALTER TABLE withdrawal_requests ALTER COLUMN wallet DROP NOT NULL")
@@ -353,7 +355,7 @@ async def accept_user_agreement(user_id):
 async def get_user(user_id):
     async with pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT user_id, username, balance, role, executor_name, executor_description, executor_city, executor_available, executor_blocked, blocked FROM users WHERE user_id=$1",
+            "SELECT user_id, username, balance, role, executor_name, executor_description, executor_city, executor_available, executor_blocked, blocked, executor_notify_enabled FROM users WHERE user_id=$1",
             user_id,
         )
 
@@ -436,12 +438,21 @@ async def set_executor_available(user_id, available):
             available, user_id
         )
 
+async def set_executor_notify_enabled(user_id, enabled):
+    """Включить/выключить уведомления о новых заявках для исполнителя"""
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE users SET executor_notify_enabled=$1 WHERE user_id=$2",
+            enabled, user_id
+        )
+
 async def get_available_executors():
-    """Получить всех доступных исполнителей"""
+    """Получить всех доступных исполнителей, у которых включены уведомления о новых заявках"""
     async with pool.acquire() as conn:
         return await conn.fetch(
             """SELECT user_id, username, executor_name, executor_description, executor_city
-               FROM users WHERE role='executor' AND executor_available=TRUE AND executor_blocked=FALSE AND blocked=FALSE ORDER BY user_id"""
+               FROM users WHERE role='executor' AND executor_available=TRUE AND executor_blocked=FALSE
+                     AND blocked=FALSE AND executor_notify_enabled=TRUE ORDER BY user_id"""
         )
 
 async def get_executor_stats(executor_id):
@@ -506,7 +517,9 @@ async def claim_order(order_id, executor_id):
                 "UPDATE orders SET executor_id=$1, status='in_progress' WHERE id=$2 AND status='new' AND executor_id IS NULL",
                 executor_id, order_id,
             )
-            await conn.execute("UPDATE users SET executor_available=FALSE WHERE user_id=$1", executor_id)
+            # Статус доступности исполнителя больше не меняется автоматически:
+            # он остаётся «Доступен», пока сам не переключит его. Защита от
+            # взятия второй активной заявки обеспечивается проверкой active_order выше.
             return order[1], 'ok'
 
 def _get_card_cipher():

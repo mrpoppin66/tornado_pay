@@ -13,7 +13,8 @@ from dotenv import load_dotenv
 from .db import (
     init_db, close_db, ensure_user, get_user, get_services, get_service, create_order, calculate_order_commission,
     get_orders, ORDER_STATUS_LABELS, get_exchange_rate, start_exchange_rate_updater,
-    get_active_executor_application, get_latest_executor_application,
+    get_active_executor_application, get_latest_executor_application, get_available_executors,
+    set_executor_notify_enabled,
     create_executor_application, answer_executor_application,
     EXECUTOR_APPLICATION_STATUSES, get_free_orders, claim_order, complete_executor_order,
     confirm_order_by_client, dispute_order_by_client,
@@ -172,6 +173,34 @@ def chat_kb(order_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Закрыть чат", callback_data=f"chat:close:{order_id}")]
     ])
+
+async def notify_available_executors_new_order(bot: Bot, order_id: int, service_name: str,
+                                                amount_rub: float, payout_usdt: float,
+                                                order_comment: str = "", exclude_user_id: int | None = None):
+    """Рассылает уведомление о новой свободной заявке всем исполнителям со
+    статусом «Доступен». Взять заявку сможет только один из них — атомарная
+    проверка происходит в claim_order при нажатии кнопки."""
+    executors = await get_available_executors()
+    if not executors:
+        return
+    comment_line = f"\nКомментарий: <b>{escape(order_comment)}</b>" if order_comment else ""
+    text = (
+        f"🆕 <b>Новая заявка #{order_id}</b>\n\n"
+        f"Услуга: <b>{escape(service_name)}</b>\n"
+        f"Переводите: <b>{amount_rub:.2f} RUB</b> → получите: <b>{payout_usdt:.4f} USDT</b>"
+        f"{comment_line}"
+    )
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="👀 Открыть заявку", callback_data=f"exec:order:{order_id}")]
+    ])
+    for row in executors:
+        executor_id = row[0]
+        if exclude_user_id is not None and executor_id == exclude_user_id:
+            continue
+        try:
+            await bot.send_message(executor_id, text, reply_markup=kb, parse_mode="HTML")
+        except Exception as e:
+            print(f"[Notify new order to executor {executor_id}] {e}")
 
 # Этот обработчик зарегистрирован ДО /start специально: пока пользователь
 # находится в чате, даже сообщения вида /start считаются сообщениями чата.
@@ -566,11 +595,15 @@ async def order_comment(m: Message, state: FSMContext):
             return
         amount_rub = float(data["amount_rub"]); rate = float(data["rate"])
         user_amount_usdt = amount_rub / rate
-        commission_usdt, _, _ = calculate_order_commission(user_amount_usdt, rate, float(data["owner_comm"]), float(data["executor_comm"]))
+        commission_usdt, owner_amount, executor_amount = calculate_order_commission(user_amount_usdt, rate, float(data["owner_comm"]), float(data["executor_comm"]))
         total_amount_usdt = user_amount_usdt + commission_usdt
         await state.clear()
         await log_order_event(oid, m.from_user.id, "created", "Заявка «Карта под оплату» создана после ввода суммы и комментария")
         await create_notification(m.from_user.id, "order", f"📋 Заявка #{oid} создана", "Заявка передана исполнителям.", oid)
+        await notify_available_executors_new_order(
+            m.bot, oid, data["service_name"], amount_rub, user_amount_usdt + executor_amount,
+            comment, exclude_user_id=m.from_user.id
+        )
         await m.answer(
             f"🧾 <b>Заявка #{oid}</b>\n\n"
             f"Услуга: <b>{escape(data['service_name'])}</b>\n"
@@ -796,7 +829,7 @@ async def order_confirm_create(c: CallbackQuery, state: FSMContext):
     amount_rub = float(data["amount_rub"])
     rate = float(data["rate"])
     user_amount_usdt = amount_rub / rate
-    commission_usdt, _, _ = calculate_order_commission(
+    commission_usdt, owner_amount, executor_amount = calculate_order_commission(
         user_amount_usdt, rate, float(data["owner_comm"]), float(data["executor_comm"])
     )
     total_amount_usdt = user_amount_usdt + commission_usdt
@@ -804,6 +837,10 @@ async def order_confirm_create(c: CallbackQuery, state: FSMContext):
     await state.clear()
     await log_order_event(oid, c.from_user.id, "created", f"Заявка создана: {data['service_name']}; реквизиты подтверждены клиентом")
     await create_notification(c.from_user.id, "order", f"📋 Заявка #{oid} создана", "Заявка передана исполнителям.", oid)
+    await notify_available_executors_new_order(
+        c.bot, oid, data["service_name"], amount_rub, user_amount_usdt + executor_amount,
+        data.get("order_comment", ""), exclude_user_id=c.from_user.id
+    )
     await c.message.edit_text(
         f"🧾 <b>Заявка #{oid}</b>\n\n"
         f"Услуга: <b>{escape(data['service_name'])}</b>\n"
@@ -926,7 +963,7 @@ async def order_chat_close(c: CallbackQuery, state: FSMContext):
     await state.clear()
     u = await get_user(c.from_user.id)
     if u and u[3] == "executor":
-        await c.message.edit_text("🧑‍💼 <b>Кабинет исполнителя</b>\n\nВы вышли из чата.", reply_markup=executor_cabinet_kb(bool(u[7]), bool(await get_executor_active_order(c.from_user.id))), parse_mode="HTML")
+        await c.message.edit_text("🧑‍💼 <b>Кабинет исполнителя</b>\n\nВы вышли из чата.", reply_markup=executor_cabinet_kb(bool(u[7]), bool(await get_executor_active_order(c.from_user.id)), bool(u[10])), parse_mode="HTML")
     else:
         await c.message.edit_text("📋 <b>Мои заявки</b>\n\nВы вышли из чата.", reply_markup=back(), parse_mode="HTML")
     await c.answer("Чат закрыт")
@@ -938,9 +975,12 @@ def executor_application_kb():
     ])
 
 
-def executor_cabinet_kb(available=False, has_active=False):
+def executor_cabinet_kb(available=False, has_active=False, notify_enabled=True):
     rows = [[InlineKeyboardButton(text=("🔴 Стать недоступным" if available else "🟢 Стать доступным"),
                                   callback_data=("exec:availability:0" if available else "exec:availability:1"))]]
+    rows.append([InlineKeyboardButton(
+        text=("🔕 Выключить уведомления о заявках" if notify_enabled else "🔔 Включить уведомления о заявках"),
+        callback_data=("exec:notify:0" if notify_enabled else "exec:notify:1"))])
     rows.append([InlineKeyboardButton(text="🆕 Заявки, которые можно взять", callback_data="exec:free")])
     if has_active:
         rows.append([InlineKeyboardButton(text="🔧 Активная заявка", callback_data="exec:active")])
@@ -962,15 +1002,17 @@ async def executor(c: CallbackQuery, state: FSMContext):
             stats=await get_executor_detailed_stats(c.from_user.id)
             active=await get_executor_active_order(c.from_user.id)
             status="🟢 Доступен" if u[7] else "🔴 Не доступен"
+            notify_status = "🔔 Включены" if u[10] else "🔕 Выключены"
             await safe_edit(c,
                 f"🧑‍💼 <b>ЛК Исполнителя</b>\n\n"
                 f"Статус: {status}\n"
+                f"Уведомления о новых заявках: {notify_status}\n"
                 f"💰 Баланс: <b>{float(u[2]):.4f} USDT</b>\n\n"
                 f"📊 Выполнено: <b>{stats['completed']}</b>\n"
                 f"❌ Отменено: <b>{stats['cancelled']}</b>\n"
                 f"⚖️ Споров: <b>{stats['disputes']}</b>\n"
                 f"⭐ Рейтинг: <b>{stats['rating']:.2f}</b> ({stats['ratings']})",
-                reply_markup=executor_cabinet_kb(bool(u[7]),bool(active)))
+                reply_markup=executor_cabinet_kb(bool(u[7]),bool(active),bool(u[10])))
     elif app and app[5] in ("pending","question"):
         label=EXECUTOR_APPLICATION_STATUSES[app[5]]
         text=f"🧑‍💼 <b>Заявка исполнителя</b>\n\nСтатус: <b>{label}</b>"
@@ -1366,8 +1408,27 @@ async def executor_availability(c: CallbackQuery):
     u = await get_user(c.from_user.id)
     await c.message.edit_text(
         f"🧑‍💼 <b>ЛК Исполнителя</b>\n\nСтатус: {'🟢 Доступен' if value else '🔴 Не доступен'}\nБаланс: {float(u[2]):.4f} USDT",
-        reply_markup=executor_cabinet_kb(value, bool(active)), parse_mode="HTML")
+        reply_markup=executor_cabinet_kb(value, bool(active), bool(u[10])), parse_mode="HTML")
     await c.answer("Статус обновлён")
+
+@dp.callback_query(F.data.startswith("exec:notify:"))
+async def executor_notify_toggle(c: CallbackQuery):
+    value = c.data.split(":")[2] == "1"
+    u = await get_user(c.from_user.id)
+    if not u or u[3] != "executor" or u[8]:
+        await c.answer("Доступ исполнителя заблокирован.", show_alert=True)
+        return
+    await set_executor_notify_enabled(c.from_user.id, value)
+    active = await get_executor_active_order(c.from_user.id)
+    u = await get_user(c.from_user.id)
+    notify_status = "🔔 Включены" if value else "🔕 Выключены"
+    await c.message.edit_text(
+        f"🧑‍💼 <b>ЛК Исполнителя</b>\n\n"
+        f"Статус: {'🟢 Доступен' if u[7] else '🔴 Не доступен'}\n"
+        f"Уведомления о новых заявках: {notify_status}\n"
+        f"Баланс: {float(u[2]):.4f} USDT",
+        reply_markup=executor_cabinet_kb(bool(u[7]), bool(active), value), parse_mode="HTML")
+    await c.answer("Уведомления о новых заявках " + ("включены" if value else "выключены"))
 
 @dp.callback_query(F.data == "notifications")
 async def notifications(c: CallbackQuery):
