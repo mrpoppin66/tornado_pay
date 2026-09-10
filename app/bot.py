@@ -18,6 +18,7 @@ from .db import (
     EXECUTOR_APPLICATION_STATUSES, get_free_orders, claim_order, complete_executor_order,
     confirm_order_by_client, dispute_order_by_client,
     get_order_chat_peer, save_order_chat_message, get_executor_active_order, get_executor_history,
+    set_executor_card_details, get_executor_card_details, set_executor_card_reference, get_executor_card_reference,
     create_withdrawal_request, get_user_transactions, get_chat_unread_count, get_chat_unread_for_orders,
     mark_chat_read, get_recent_chat_messages, get_executor_detailed_stats,
     add_order_evidence, log_order_event, create_notification, get_notifications, get_unread_notifications_count, mark_notifications_read,
@@ -95,6 +96,9 @@ dp.callback_query.outer_middleware(AgreementMiddleware())
 class UserStates(StatesGroup):
     waiting_order_amount = State()
     waiting_payment_details = State()
+    waiting_executor_card_number = State()
+    waiting_executor_card_expiry = State()
+    waiting_executor_cardholder = State()
     executor_experience = State()
     executor_services = State()
     executor_comment = State()
@@ -489,6 +493,40 @@ async def order_amount(m: Message, state: FSMContext):
     # только после ввода и подтверждения реквизитов.
     await state.update_data(amount_rub=amount_rub, rate=rate)
     payment_type = data.get("payment_type", "phone")
+
+    # Для «Карты под оплату» клиент не вводит реквизиты. Заявка
+    # создаётся сразу после суммы и становится доступна исполнителям.
+    if payment_type == "executor_card":
+        oid, create_error = await create_order(
+            m.from_user.id, data["service_id"], amount_rub, rate, None, None, None
+        )
+        if not oid:
+            messages = {
+                "insufficient_balance": "❌ Недостаточно USDT на балансе для создания заявки.",
+                "below_minimum": "❌ Сумма ниже минимальной для этой услуги.",
+                "above_maximum": "❌ Сумма выше максимальной для этой услуги.",
+            }
+            await m.answer(messages.get(create_error, "❌ Не удалось создать заявку. Попробуйте ещё раз."))
+            return
+        user_amount_usdt = amount_rub / rate
+        commission_usdt, _, _ = calculate_order_commission(
+            user_amount_usdt, rate, float(data["owner_comm"]), float(data["executor_comm"])
+        )
+        total_amount_usdt = user_amount_usdt + commission_usdt
+        await state.clear()
+        await log_order_event(oid, m.from_user.id, "created", "Заявка «Карта под оплату» создана после ввода суммы")
+        await create_notification(m.from_user.id, "order", f"📋 Заявка #{oid} создана", "Заявка передана исполнителям.", oid)
+        await m.answer(
+            f"🧾 <b>Заявка #{oid}</b>\n\n"
+            f"Услуга: <b>{escape(data['service_name'])}</b>\n"
+            f"Сумма: <b>{amount_rub:.2f} RUB</b>\n"
+            f"К оплате: <b>{total_amount_usdt:.4f} USDT</b>\n\n"
+            f"Курс {rate:.2f} RUB/USDT зафиксирован.\n\n"
+            "⏳ <b>Ожидание исполнителя...</b>",
+            reply_markup=back(), parse_mode="HTML"
+        )
+        return
+
     if payment_type == "card":
         prompt = (
             "💳 <b>Номер карты</b>\n\n"
@@ -520,6 +558,7 @@ def _payment_label(payment_type):
         "phone": "📱 Номер телефона",
         "card": "💳 Номер карты",
         "qr": "🧾 QR / ссылка на оплату",
+        "executor_card": "💳 Карта исполнителя",
     }.get(payment_type, "Реквизиты")
 
 
@@ -980,15 +1019,16 @@ async def executor_order_detail(c: CallbackQuery):
     r=next((x for x in rows if int(x[0])==oid),None)
     if not r:
         await c.answer("Заявка уже недоступна.",show_alert=True); return
+    extra = "\n\n💳 После взятия заявки введите полные реквизиты своей карты (номер, срок и имя держателя). Данные будут зашифрованы в БД." if "Карта под оплату" in str(r[1]) else ""
     text=(f"🆕 <b>Заявка #{r[0]}</b>\n\n"
           f"Услуга: <b>{escape(r[1])}</b>\n\n"
           f"Вы переводите: <b>{float(r[2]):.2f} RUB</b>\n"
-          f"Получите на баланс: <b>{(float(r[3])+float(r[4])):.4f} USDT</b>")
+          f"Получите на баланс: <b>{(float(r[3])+float(r[4])):.4f} USDT</b>" + extra)
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Взять заявку",callback_data=f"exec:claim:{oid}")],[InlineKeyboardButton(text="⬅️ Свободные заявки",callback_data="exec:free")]])
     await c.message.edit_text(text,reply_markup=kb,parse_mode="HTML"); await c.answer()
 
 @dp.callback_query(F.data.startswith("exec:claim:"))
-async def executor_claim(c: CallbackQuery):
+async def executor_claim(c: CallbackQuery, state: FSMContext):
     oid=int(c.data.split(":")[2])
     client_id,result=await claim_order(oid,c.from_user.id)
     if result != "ok":
@@ -998,6 +1038,17 @@ async def executor_claim(c: CallbackQuery):
     await log_order_event(oid, c.from_user.id, "claimed", "Исполнитель взял заявку и получил доступ к реквизитам")
     await create_notification(client_id, "order", f"👷 Исполнитель найден по заявке #{oid}", "Заявка принята исполнителем.", oid)
     active_order = await get_executor_active_order(c.from_user.id)
+    if active_order and "Карта под оплату" in str(active_order[1]):
+        await state.clear()
+        await state.update_data(executor_card_order_id=oid)
+        await state.set_state(UserStates.waiting_executor_card_number)
+        await c.bot.send_message(
+            c.from_user.id,
+            f"💳 <b>Карта под оплату — заявка #{oid}</b>\n\n"
+            "Введите <b>полный номер карты</b> исполнителя, которую будете использовать для оплаты.\n\n"
+            "Данные будут зашифрованы перед сохранением в БД. CVV/CVC и СМС/OTP-коды бот не запрашивает и не сохраняет.",
+            parse_mode="HTML"
+        )
     if active_order and active_order[12] == "qr_photo" and active_order[14]:
         try:
             await c.bot.send_photo(c.from_user.id, active_order[14], caption=f"🧾 QR-код по заявке #{oid}")
@@ -1007,6 +1058,69 @@ async def executor_claim(c: CallbackQuery):
         await c.bot.send_message(client_id, f"👷 <b>Исполнитель найден</b>\n\nВаша заявка #{oid} принята исполнителем.\nТеперь вы можете общаться через анонимный чат TornadoPay.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Открыть чат",callback_data=f"chat:open:{oid}")]]), parse_mode="HTML")
     except Exception as e: print(f"[Notify claim] {e}")
     await executor_active(c)
+
+@dp.message(UserStates.waiting_executor_card_number)
+async def executor_card_number(m: Message, state: FSMContext):
+    value = (m.text or "").strip()
+    digits = re.sub(r"\D", "", value)
+    if not 13 <= len(digits) <= 19:
+        await m.answer("❌ Неверный номер карты. Пришлите 13–19 цифр.")
+        return
+    await state.update_data(executor_card_number=digits)
+    await state.set_state(UserStates.waiting_executor_card_expiry)
+    await m.answer(
+        "📅 <b>Срок действия карты</b>\n\nВведите в формате <code>MM/YY</code>.\n\n"
+        "CVV/CVC вводить не нужно — бот его не запрашивает.",
+        parse_mode="HTML"
+    )
+
+@dp.message(UserStates.waiting_executor_card_expiry)
+async def executor_card_expiry(m: Message, state: FSMContext):
+    value = (m.text or "").strip().replace(".", "/").replace("-", "/")
+    if not re.fullmatch(r"(?:0[1-9]|1[0-2])/\d{2}", value):
+        await m.answer("❌ Неверный формат. Используйте <code>MM/YY</code>, например <code>09/29</code>.", parse_mode="HTML")
+        return
+    await state.update_data(executor_card_expiry=value)
+    await state.set_state(UserStates.waiting_executor_cardholder)
+    await m.answer("👤 <b>Имя держателя</b>\n\nВведите имя и фамилию так, как указано на карте.", parse_mode="HTML")
+
+@dp.message(UserStates.waiting_executor_cardholder)
+async def executor_cardholder(m: Message, state: FSMContext):
+    data = await state.get_data()
+    oid = data.get("executor_card_order_id")
+    holder = " ".join((m.text or "").split())[:120]
+    if not oid or len(holder) < 2:
+        await m.answer("❌ Введите имя и фамилию держателя карты.")
+        return
+    ok, reason = await set_executor_card_details(
+        oid, m.from_user.id, data.get("executor_card_number", ""),
+        data.get("executor_card_expiry", ""), holder
+    )
+    if not ok:
+        messages = {
+            "invalid_card": "❌ Номер карты выглядит некорректно. Проверьте цифры и попробуйте снова.",
+            "invalid_expiry": "❌ Проверьте срок действия карты в формате MM/YY.",
+            "invalid_holder": "❌ Укажите имя и фамилию держателя карты.",
+            "unavailable": "❌ Заявка уже недоступна для изменения.",
+        }
+        await m.answer(messages.get(reason, "❌ Не удалось сохранить данные карты."))
+        return
+    await state.clear()
+    details = await get_executor_card_details(oid, m.from_user.id)
+    label = f"Карта •••• {details['card_number'][-4:]}" if details else "Карта"
+    await log_order_event(oid, m.from_user.id, "executor_card_details_added", "Исполнитель указал реквизиты карты; полные данные сохранены в зашифрованном виде")
+    peer = await get_order_chat_peer(oid, m.from_user.id)
+    if peer:
+        try:
+            await m.bot.send_message(peer["peer_id"], f"💳 <b>Исполнитель подготовил карту для заявки #{oid}.</b>\n\nДальнейшие действия согласуйте через анонимный чат.", parse_mode="HTML", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Открыть чат", callback_data=f"chat:open:{oid}")]]))
+        except Exception as e:
+            print(f"[executor card notify] {e}")
+    await m.answer(
+        f"💳 <b>{label}</b> сохранена.\n\n"
+        "Полные реквизиты зашифрованы в БД. Продолжайте работу через анонимный чат.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Открыть чат", callback_data=f"chat:open:{oid}")],[InlineKeyboardButton(text="⬅️ Активная заявка", callback_data="exec:active")]]),
+        parse_mode="HTML"
+    )
 
 @dp.callback_query(F.data.startswith("exec:done:"))
 async def executor_done(c: CallbackQuery):
@@ -1091,7 +1205,19 @@ async def executor_active(c: CallbackQuery):
         return
     status = ORDER_STATUS_LABELS.get(o[6], o[6])
     payment_method, payment_details, payment_file_id = o[12], o[13], o[14]
-    if payment_method == "qr_photo":
+    executor_card_reference = await get_executor_card_reference(o[0], c.from_user.id) if "Карта под оплату" in str(o[1]) else None
+    executor_card_details = await get_executor_card_details(o[0], c.from_user.id) if "Карта под оплату" in str(o[1]) else None
+    if "Карта под оплату" in str(o[1]):
+        if executor_card_details:
+            payment_text = (
+                f"💳 <b>{escape(executor_card_reference or 'Карта')}</b>\n"
+                f"Номер: <code>{escape(executor_card_details['card_number'])}</code>\n"
+                f"Срок: <code>{escape(executor_card_details['expiry'])}</code>\n"
+                f"Держатель: <code>{escape(executor_card_details['cardholder'])}</code>"
+            )
+        else:
+            payment_text = "💳 <b>Данные карты:</b> ещё не указаны"
+    elif payment_method == "qr_photo":
         payment_text = "🧾 <b>QR / ссылка на оплату:</b> 📷 Фото QR-кода"
     elif payment_method == "qr_link":
         payment_text = f"🧾 <b>QR / ссылка на оплату:</b> 🔗 {escape(payment_details or '')}"

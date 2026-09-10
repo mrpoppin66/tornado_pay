@@ -2,7 +2,15 @@ import os
 import asyncpg
 import aiohttp
 import asyncio
+import json
+import re
 from datetime import datetime
+
+try:
+    from cryptography.fernet import Fernet, InvalidToken
+except ImportError:  # dependency is declared in requirements.txt
+    Fernet = None
+    InvalidToken = Exception
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
@@ -275,6 +283,11 @@ async def init_db():
         await _add_column_if_missing(conn, "orders", "payment_method", "TEXT")
         await _add_column_if_missing(conn, "orders", "payment_details", "TEXT")
         await _add_column_if_missing(conn, "orders", "payment_file_id", "TEXT")
+        # V18: «Карта под оплату» хранит безопасную метку отдельно,
+        # а полные реквизиты карты — только в зашифрованном виде.
+        # CVV/CVC и OTP/СМС-коды бот не запрашивает и не сохраняет.
+        await _add_column_if_missing(conn, "orders", "executor_card_reference", "TEXT")
+        await _add_column_if_missing(conn, "orders", "executor_card_encrypted", "TEXT")
 
         # V16: фиксированный каталог из четырёх услуг и способ реквизитов.
         # Существующие данные не удаляем: недостающие услуги добавляются,
@@ -284,6 +297,7 @@ async def init_db():
             ("💳 Перевод на карту", "Перевод средств на банковскую карту", "card"),
             ("📲 Перевод по СБП", "Перевод на номер телефона через СБП", "phone"),
             ("🧾 Оплата по QR", "Оплата по QR-коду: ссылкой или фотографией QR", "qr"),
+            ("💳 Карта под оплату", "Исполнитель использует свою карту для оплаты; детали согласуются через чат", "executor_card"),
         ]
         for name, description, payment_type in service_specs:
             row = await conn.fetchrow("SELECT id FROM services WHERE name=$1 LIMIT 1", name)
@@ -492,6 +506,90 @@ async def claim_order(order_id, executor_id):
             )
             await conn.execute("UPDATE users SET executor_available=FALSE WHERE user_id=$1", executor_id)
             return order[1], 'ok'
+
+def _get_card_cipher():
+    key = os.getenv("CARD_DATA_ENCRYPTION_KEY")
+    if not key:
+        raise RuntimeError(
+            "CARD_DATA_ENCRYPTION_KEY is not set. Generate a Fernet key and add it to the environment."
+        )
+    if Fernet is None:
+        raise RuntimeError("cryptography package is not installed")
+    return Fernet(key.encode())
+
+async def set_executor_card_details(order_id, executor_id, card_number, expiry, cardholder):
+    """Сохранить реквизиты карты исполнителя.
+
+    Полные данные шифруются Fernet перед записью в БД. В открытом виде
+    сохраняется только метка «Карта •••• 1234». CVV/CVC и OTP/СМС-коды
+    намеренно не принимаются и не сохраняются.
+    """
+    card_number = re.sub(r"\D", "", card_number or "")
+    expiry = (expiry or "").strip()
+    cardholder = " ".join((cardholder or "").split())[:120]
+    if not (13 <= len(card_number) <= 19):
+        return False, "invalid_card"
+    if not re.fullmatch(r"(?:0[1-9]|1[0-2])/\d{2}", expiry):
+        return False, "invalid_expiry"
+    if len(cardholder) < 2:
+        return False, "invalid_holder"
+    # Простая проверка Луна (Luhn), чтобы не сохранять явно ошибочный PAN.
+    total = 0
+    parity = len(card_number) % 2
+    for i, ch in enumerate(card_number):
+        d = int(ch)
+        if i % 2 == parity:
+            d *= 2
+            if d > 9:
+                d -= 9
+        total += d
+    if total % 10 != 0:
+        return False, "invalid_card"
+
+    payload = json.dumps({
+        "card_number": card_number,
+        "expiry": expiry,
+        "cardholder": cardholder,
+    }, ensure_ascii=False, separators=(",", ":"))
+    encrypted = _get_card_cipher().encrypt(payload.encode()).decode()
+    label = f"Карта •••• {card_number[-4:]}"
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE orders
+               SET executor_card_reference=$1, executor_card_encrypted=$2
+               WHERE id=$3 AND executor_id=$4 AND status='in_progress'
+               RETURNING id""", label, encrypted, order_id, executor_id)
+        return (bool(row), "ok" if row else "unavailable")
+
+async def get_executor_card_details(order_id, executor_id):
+    async with pool.acquire() as conn:
+        encrypted = await conn.fetchval(
+            "SELECT executor_card_encrypted FROM orders WHERE id=$1 AND executor_id=$2",
+            order_id, executor_id)
+    if not encrypted:
+        return None
+    try:
+        return json.loads(_get_card_cipher().decrypt(encrypted.encode()).decode())
+    except (InvalidToken, ValueError, TypeError, json.JSONDecodeError):
+        return None
+
+async def set_executor_card_reference(order_id, executor_id, reference):
+    """Обратная совместимость со старой V17-меткой. Новые заявки используют set_executor_card_details."""
+    reference = (reference or "").strip()[:120]
+    if not reference:
+        return False
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """UPDATE orders SET executor_card_reference=$1
+               WHERE id=$2 AND executor_id=$3 AND status='in_progress'
+               RETURNING id""", reference, order_id, executor_id)
+        return bool(row)
+
+async def get_executor_card_reference(order_id, executor_id):
+    async with pool.acquire() as conn:
+        return await conn.fetchval(
+            "SELECT executor_card_reference FROM orders WHERE id=$1 AND executor_id=$2",
+            order_id, executor_id)
 
 async def complete_executor_order(order_id, executor_id):
     """Mark an order as completed by executor; funds remain in escrow until client confirmation."""
