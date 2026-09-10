@@ -453,14 +453,25 @@ async def admin_balance_finish(m: Message, state: FSMContext):
         return
     data = await state.get_data()
     delta = amount * data["sign"]
-    await adjust_balance(data["target_user_id"], delta)
+    target_id = data["target_user_id"]
+    new_balance = await adjust_balance(target_id, delta)
     await state.clear()
-    u = await find_user(str(data["target_user_id"]))
+    u = await find_user(str(target_id))
     if u:
         text, kb = render_user_profile(u)
         await m.answer("✅ Баланс обновлён.\n\n" + text, reply_markup=kb, parse_mode="HTML")
     else:
         await m.answer("✅ Баланс обновлён.", reply_markup=admin_back_kb())
+    if new_balance is not None:
+        sign = "+" if delta > 0 else "-"
+        try:
+            await m.bot.send_message(
+                target_id,
+                f"💳 Администратор изменил ваш баланс: {sign}{amount:.4f} USDT.\n"
+                f"Текущий баланс: {float(new_balance):.4f} USDT",
+            )
+        except Exception as e:
+            print(f"[Balance notify] {e}")
 
 
 # ---------- Услуги ----------

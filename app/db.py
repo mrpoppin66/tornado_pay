@@ -227,6 +227,18 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, id DESC);
         CREATE INDEX IF NOT EXISTS idx_notifications_unread ON notifications(user_id, read_at);
 
+        CREATE TABLE IF NOT EXISTS deposits(
+            id BIGSERIAL PRIMARY KEY,
+            user_id BIGINT NOT NULL REFERENCES users(user_id),
+            invoice_id BIGINT NOT NULL UNIQUE,
+            amount NUMERIC(18,4) NOT NULL CHECK (amount > 0),
+            status TEXT NOT NULL DEFAULT 'pending',
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            paid_at TIMESTAMPTZ
+        );
+        CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id, id);
+        CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status, id);
+
         """)
 
         # Миграции для старых баз: добавляем колонки, которых может не хватать
@@ -933,11 +945,70 @@ async def find_user(query: str):
             query,
         )
 
-async def adjust_balance(user_id, delta):
+async def adjust_balance(user_id, delta, admin_comment=None):
+    """Изменяет баланс пользователя вручную (админом) и логирует операцию
+    в историю транзакций, чтобы она была видна в «Истории операций»."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            new_balance = await conn.fetchval(
+                "UPDATE users SET balance = balance + $1 WHERE user_id=$2 RETURNING balance",
+                delta, user_id,
+            )
+            if new_balance is None:
+                return None
+            kind = "admin_credit" if delta >= 0 else "admin_debit"
+            description = admin_comment or (
+                "Начисление администратором" if delta >= 0 else "Списание администратором"
+            )
+            await conn.execute(
+                "INSERT INTO transactions(user_id,amount,type,description) VALUES($1,$2,$3,$4)",
+                user_id, delta, kind, description,
+            )
+            return new_balance
+
+# ---------- Депозиты (пополнение через xRocket) ----------
+
+async def create_deposit(user_id, invoice_id, amount):
     async with pool.acquire() as conn:
         return await conn.fetchval(
-            "UPDATE users SET balance = balance + $1 WHERE user_id=$2 RETURNING balance",
-            delta, user_id,
+            "INSERT INTO deposits(user_id, invoice_id, amount) VALUES($1,$2,$3) RETURNING id",
+            user_id, invoice_id, amount,
+        )
+
+async def get_deposit_by_invoice(invoice_id):
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT id, user_id, invoice_id, amount, status FROM deposits WHERE invoice_id=$1",
+            invoice_id,
+        )
+
+async def mark_deposit_paid(invoice_id, paid_amount=None):
+    """Идемпотентно зачисляет депозит на баланс пользователя: если счёт с
+    таким invoice_id уже обработан (или не найден) — ничего не делает и
+    возвращает None. Так безопасно вызывать эту функцию и из вебхука
+    xRocket, и из ручной проверки статуса — двойного начисления не будет."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row = await conn.fetchrow(
+                "SELECT id, user_id, amount, status FROM deposits WHERE invoice_id=$1 FOR UPDATE",
+                invoice_id,
+            )
+            if row is None or row["status"] != "pending":
+                return None
+            credit = float(paid_amount) if paid_amount else float(row["amount"])
+            await conn.execute("UPDATE deposits SET status='paid', paid_at=now() WHERE id=$1", row["id"])
+            await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id=$2", credit, row["user_id"])
+            await conn.execute(
+                "INSERT INTO transactions(user_id,amount,type,description) VALUES($1,$2,'deposit',$3)",
+                row["user_id"], credit, f"Пополнение через xRocket (счёт #{invoice_id})",
+            )
+            return {"deposit_id": row["id"], "user_id": row["user_id"], "amount": credit}
+
+async def mark_deposit_expired(invoice_id):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            "UPDATE deposits SET status='expired' WHERE invoice_id=$1 AND status='pending'",
+            invoice_id,
         )
 
 async def get_user_transactions(user_id, limit=30):

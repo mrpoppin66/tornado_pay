@@ -1,4 +1,5 @@
 import os
+import json
 from html import escape
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -6,6 +7,7 @@ from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, TelegramObject
+from aiohttp import web
 from dotenv import load_dotenv
 from .db import (
     init_db, close_db, ensure_user, get_user, get_services, get_service, create_order, calculate_order_commission,
@@ -20,7 +22,9 @@ from .db import (
     add_order_evidence, log_order_event, create_notification, get_notifications, get_unread_notifications_count, mark_notifications_read,
     get_order_events, get_order_evidence, set_user_blocked, get_executor_profile, get_executor_history_detailed, get_user_blocked,
     get_user_agreement_accepted, accept_user_agreement,
+    create_deposit, get_deposit_by_invoice, mark_deposit_paid, mark_deposit_expired,
 )
+from . import xrocket
 from .admin import admin_router, ADMIN_IDS
 
 load_dotenv()
@@ -95,6 +99,7 @@ class UserStates(StatesGroup):
     executor_answer = State()
     chat_message = State()
     withdrawal_amount = State()
+    deposit_amount = State()
 
 # Custom_emoji_id премиум-эмодзи для кнопок главного меню. Работает только
 # если владелец бота (аккаунт, на который выпущен BOT_TOKEN) имеет активную
@@ -276,9 +281,11 @@ async def agree_tos(c: CallbackQuery):
 async def balance(c: CallbackQuery):
     u = await get_user(c.from_user.id)
     await safe_edit(c,
-        f"💰 <b>Баланс</b>\n\n{u[2]:.2f} USDT\n\n"
-        "CryptoBot/xRocket подключим следующим этапом.",
-        reply_markup=back(), parse_mode="HTML")
+        f"💰 <b>Баланс</b>\n\n{u[2]:.2f} USDT",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="💳 Пополнить", callback_data="profile:deposit")],
+            [InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back")],
+        ]), parse_mode="HTML")
     await c.answer()
 
 @dp.callback_query(F.data == "profile")
@@ -321,9 +328,88 @@ async def profile_transactions(c: CallbackQuery):
     ]), parse_mode="HTML")
     await c.answer()
 
+MIN_DEPOSIT_USDT = 1.0
+DEPOSIT_EXPIRE_MINUTES = max(1, xrocket.DEPOSIT_EXPIRE_SECONDS // 60)
+
 @dp.callback_query(F.data == "profile:deposit")
-async def profile_deposit(c: CallbackQuery):
-    await c.answer("Пополнение будет подключено на этапе интеграции CryptoBot/xRocket.", show_alert=True)
+async def profile_deposit_start(c: CallbackQuery, state: FSMContext):
+    if not xrocket.is_configured():
+        await c.answer("Пополнение временно недоступно, попробуйте позже.", show_alert=True)
+        return
+    await state.set_state(UserStates.deposit_amount)
+    await safe_edit(c,
+        f"💳 <b>Пополнение через xRocket</b>\n\n"
+        f"Введите сумму пополнения в USDT (минимум {MIN_DEPOSIT_USDT:.0f} USDT):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Личный кабинет", callback_data="profile")]
+        ]), parse_mode="HTML")
+    await c.answer()
+
+@dp.message(UserStates.deposit_amount)
+async def profile_deposit_amount(m: Message, state: FSMContext):
+    try:
+        amount = float((m.text or "").strip().replace(",", "."))
+    except ValueError:
+        await m.answer("Введите сумму числом, например 10 или 15.5")
+        return
+    if amount < MIN_DEPOSIT_USDT:
+        await m.answer(f"Минимальная сумма пополнения — {MIN_DEPOSIT_USDT:.0f} USDT.")
+        return
+    await state.clear()
+    try:
+        invoice = await xrocket.create_invoice(
+            amount,
+            description=f"Пополнение баланса TornadoPay (ID {m.from_user.id})",
+            payload=str(m.from_user.id),
+        )
+        await create_deposit(m.from_user.id, invoice["id"], amount)
+    except xrocket.XRocketError as e:
+        print(f"[xrocket create_invoice] {e}")
+        await m.answer(
+            "❌ Не удалось создать счёт на оплату. Попробуйте ещё раз чуть позже.",
+            reply_markup=back())
+        return
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💳 Оплатить через xRocket", url=invoice["link"])],
+        [InlineKeyboardButton(text="🔄 Я оплатил / проверить", callback_data=f"dep:check:{invoice['id']}")],
+        [InlineKeyboardButton(text="⬅️ Личный кабинет", callback_data="profile")],
+    ])
+    await m.answer(
+        f"🧾 Счёт на <b>{amount:.2f} USDT</b> создан.\n\n"
+        f"Нажмите «Оплатить через xRocket», подтвердите платёж в приложении, "
+        f"после чего баланс пополнится автоматически. Если этого не произошло — "
+        f"нажмите «Я оплатил / проверить».\n\n"
+        f"⏳ Счёт действителен {DEPOSIT_EXPIRE_MINUTES} мин.",
+        reply_markup=kb, parse_mode="HTML")
+
+@dp.callback_query(F.data.startswith("dep:check:"))
+async def profile_deposit_check(c: CallbackQuery):
+    invoice_id = int(c.data.split(":")[2])
+    try:
+        invoice = await xrocket.get_invoice(invoice_id)
+    except xrocket.XRocketError as e:
+        print(f"[xrocket get_invoice] {e}")
+        await c.answer("Не удалось проверить статус оплаты. Попробуйте позже.", show_alert=True)
+        return
+    status = invoice.get("status")
+    if status == "paid":
+        payments = invoice.get("payments") or []
+        paid_amount = payments[-1]["paymentAmountReceived"] if payments else invoice.get("amount")
+        result = await mark_deposit_paid(invoice_id, paid_amount)
+        if result:
+            u = await get_user(c.from_user.id)
+            await safe_edit(c,
+                f"✅ Баланс пополнен на <b>{result['amount']:.4f} USDT</b>.\n\n"
+                f"Текущий баланс: <b>{float(u[2]):.4f} USDT</b>",
+                reply_markup=back(), parse_mode="HTML")
+        else:
+            await c.answer("Этот счёт уже был зачислен ранее.", show_alert=True)
+        return
+    if status == "expired":
+        await mark_deposit_expired(invoice_id)
+        await c.answer("Счёт истёк. Создайте новый через «Пополнить».", show_alert=True)
+        return
+    await c.answer("Оплата пока не найдена. Если вы уже оплатили — подождите немного и проверьте снова.", show_alert=True)
 
 @dp.callback_query(F.data == "services")
 async def services(c: CallbackQuery):
@@ -950,6 +1036,63 @@ async def go_back(c: CallbackQuery, state: FSMContext):
         await c.message.answer(caption, reply_markup=kb, parse_mode="HTML")
     await c.answer()
 
+async def _xrocket_webhook_handler(request):
+    """Обрабатывает вебхук xRocket Pay об оплате счёта. Настраивается в
+    боте @xRocket на странице управления приложением (Rocket Pay ->
+    ваше приложение -> Webhook), URL: https://ваш-домен{XROCKET_WEBHOOK_PATH}."""
+    raw = await request.read()
+    signature = request.headers.get("rocket-pay-signature", "")
+    if not xrocket.verify_webhook_signature(raw, signature):
+        return web.Response(status=401, text="invalid signature")
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception:
+        return web.Response(status=400, text="invalid json")
+    if payload.get("type") != "invoicePay":
+        return web.Response(status=200, text="ignored")
+    data = payload.get("data") or {}
+    invoice_id = data.get("id")
+    if invoice_id is None:
+        return web.Response(status=400, text="no invoice id")
+    payment = data.get("payment") or {}
+    paid_amount = payment.get("paymentAmountReceived") or payment.get("paymentAmount") or data.get("amount")
+    result = await mark_deposit_paid(invoice_id, paid_amount)
+    if result:
+        bot_instance = request.app.get("bot")
+        if bot_instance is not None:
+            try:
+                await bot_instance.send_message(
+                    result["user_id"],
+                    f"✅ Баланс пополнен на <b>{result['amount']:.4f} USDT</b> через xRocket.",
+                    parse_mode="HTML",
+                )
+            except Exception as e:
+                print(f"[xrocket webhook notify] {e}")
+    return web.Response(status=200, text="ok")
+
+
+async def start_xrocket_webhook_server(bot_instance: Bot):
+    """Поднимает отдельный HTTP-сервер для приёма вебхуков xRocket Pay,
+    параллельно с long polling бота. Если XROCKET_API_KEY не задан —
+    сервер не запускается (интеграция просто выключена)."""
+    if not xrocket.is_configured():
+        print("[xrocket] XROCKET_API_KEY не задан — сервер вебхуков не запущен.")
+        return None
+    app = web.Application()
+    app["bot"] = bot_instance
+    path = os.getenv("XROCKET_WEBHOOK_PATH", "/webhooks/xrocket")
+    app.router.add_post(path, _xrocket_webhook_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    host = os.getenv("XROCKET_WEBHOOK_HOST", "0.0.0.0")
+    port = int(os.getenv("XROCKET_WEBHOOK_PORT", "8085"))
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    print(f"[xrocket] Webhook слушает на http://{host}:{port}{path} "
+          f"(этот путь нужно опубликовать наружу по HTTPS и указать в настройках приложения в @xRocket)")
+    return runner
+
+
 async def main():
     await init_db()
 
@@ -958,7 +1101,10 @@ async def main():
     asyncio.create_task(start_exchange_rate_updater())
 
     bot = Bot(TOKEN)
+    webhook_runner = await start_xrocket_webhook_server(bot)
     try:
         await dp.start_polling(bot)
     finally:
+        if webhook_runner is not None:
+            await webhook_runner.cleanup()
         await close_db()
