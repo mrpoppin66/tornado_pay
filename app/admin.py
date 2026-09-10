@@ -228,12 +228,27 @@ def render_order_detail(o):
     executor_gets_usdt = float(o[6])
     amount_rub = float(o[4])
 
+    payment_method = o[12]
+    payment_details = o[13]
+    payment_file_id = o[14]
+    if payment_method == "qr_photo":
+        payment_text = "📷 Фото QR-кода загружено"
+    elif payment_method == "qr_link":
+        payment_text = f"🔗 {escape(payment_details or '—')}"
+    elif payment_method == "card":
+        payment_text = f"<code>{escape(payment_details or '—')}</code>"
+    elif payment_method == "phone":
+        payment_text = f"<code>{escape(payment_details or '—')}</code>"
+    else:
+        payment_text = "—"
+
     text = (
         f"🧾 <b>Заявка #{o[0]}</b>\n\n"
         f"Клиент: @{o[2] or '—'} (<code>{o[1]}</code>)\n"
         f"Услуга: {o[3]}\n\n"
         f"<b>Сумма в рублях:</b> {amount_rub:.2f} RUB\n"
         f"<b>Сумма в USDT:</b> {user_amount_usdt:.4f} USDT\n\n"
+        f"<b>Реквизиты для перевода:</b>\n{payment_text}\n\n"
         f"<b>Разбор:</b>\n"
         f"Вам (комиссия): {owner_comm:.4f} USDT\n"
         f"Исполнителю: {executor_gets_usdt:.4f} USDT\n\n"

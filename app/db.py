@@ -116,6 +116,7 @@ async def init_db():
             max_amount NUMERIC(14,2) NOT NULL DEFAULT 1000000000.0,
             owner_commission NUMERIC(5,2) NOT NULL DEFAULT 0,
             executor_commission NUMERIC(5,2) NOT NULL DEFAULT 0,
+            payment_type TEXT NOT NULL DEFAULT 'phone',
             active BOOLEAN NOT NULL DEFAULT TRUE,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         );
@@ -136,7 +137,10 @@ async def init_db():
             confirmed_at TIMESTAMPTZ,
             disputed_at TIMESTAMPTZ,
             settled_at TIMESTAMPTZ,
-            escrow_amount_usdt NUMERIC(18,4) NOT NULL DEFAULT 0
+            escrow_amount_usdt NUMERIC(18,4) NOT NULL DEFAULT 0,
+            payment_method TEXT,
+            payment_details TEXT,
+            payment_file_id TEXT
         );
         CREATE TABLE IF NOT EXISTS executor_applications(
             id SERIAL PRIMARY KEY,
@@ -257,6 +261,7 @@ async def init_db():
         await _add_column_if_missing(conn, "users", "agreement_accepted_at", "TIMESTAMPTZ")
         await conn.execute("ALTER TABLE users ALTER COLUMN balance TYPE NUMERIC(18,4) USING balance::numeric(18,4)")
         await _add_column_if_missing(conn, "services", "max_amount", "NUMERIC(14,2) NOT NULL DEFAULT 1000000000.0")
+        await _add_column_if_missing(conn, "services", "payment_type", "TEXT NOT NULL DEFAULT 'phone'")
         await _add_column_if_missing(conn, "services", "active", "BOOLEAN NOT NULL DEFAULT TRUE")
         await _add_column_if_missing(conn, "services", "created_at", "TIMESTAMPTZ NOT NULL DEFAULT now()")
         await _add_column_if_missing(conn, "orders", "exchange_rate", "NUMERIC(14,4) NOT NULL DEFAULT 100")
@@ -267,17 +272,33 @@ async def init_db():
         await _add_column_if_missing(conn, "orders", "settled_at", "TIMESTAMPTZ")
         await _add_column_if_missing(conn, "orders", "escrow_amount_usdt", "NUMERIC(18,4) NOT NULL DEFAULT 0")
         await _add_column_if_missing(conn, "orders", "settlement_for", "TEXT")
+        await _add_column_if_missing(conn, "orders", "payment_method", "TEXT")
+        await _add_column_if_missing(conn, "orders", "payment_details", "TEXT")
+        await _add_column_if_missing(conn, "orders", "payment_file_id", "TEXT")
 
-        count = await conn.fetchval("SELECT COUNT(*) FROM services")
-        if count == 0:
-            await conn.executemany(
-                "INSERT INTO services(name, description, min_amount, owner_commission, executor_commission) VALUES($1, $2, $3, $4, $5)",
-                [
-                    ("📱 Пополнение мобильного", "Пополнение номера телефона", 10.0, 5.0, 5.0),
-                    ("🧾 Оплата по QR", "Оплата по предоставленному QR-коду", 10.0, 5.0, 5.0),
-                    ("💳 Перевод на карту", "Перевод средств на банковскую карту", 10.0, 5.0, 5.0),
-                ],
-            )
+        # V16: фиксированный каталог из четырёх услуг и способ реквизитов.
+        # Существующие данные не удаляем: недостающие услуги добавляются,
+        # а у старых записей только уточняется тип реквизитов.
+        service_specs = [
+            ("📱 Пополнение мобильного", "Пополнение номера телефона", "phone"),
+            ("💳 Перевод на карту", "Перевод средств на банковскую карту", "card"),
+            ("📲 Перевод по СБП", "Перевод на номер телефона через СБП", "phone"),
+            ("🧾 Оплата по QR", "Оплата по QR-коду: ссылкой или фотографией QR", "qr"),
+        ]
+        for name, description, payment_type in service_specs:
+            row = await conn.fetchrow("SELECT id FROM services WHERE name=$1 LIMIT 1", name)
+            if row:
+                await conn.execute("UPDATE services SET description=$1, payment_type=$2 WHERE id=$3", description, payment_type, row[0])
+            else:
+                await conn.execute(
+                    "INSERT INTO services(name, description, min_amount, owner_commission, executor_commission, payment_type) VALUES($1, $2, $3, $4, $5, $6)",
+                    name, description, 10.0, 5.0, 5.0, payment_type
+                )
+        # Совместимость с предыдущими названиями без эмодзи.
+        await conn.execute("UPDATE services SET payment_type='phone' WHERE name ILIKE '%Пополнение мобильного%'")
+        await conn.execute("UPDATE services SET payment_type='card' WHERE name ILIKE '%Перевод на карту%'")
+        await conn.execute("UPDATE services SET payment_type='phone' WHERE name ILIKE '%Перевод по СБП%'")
+        await conn.execute("UPDATE services SET payment_type='qr' WHERE name ILIKE '%Оплата по QR%'")
 
         # V10: состояние прочитанных сообщений
         await conn.execute("""CREATE TABLE IF NOT EXISTS order_chat_reads(order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, last_read_id BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(order_id,user_id)); CREATE INDEX IF NOT EXISTS idx_order_chat_reads_user ON order_chat_reads(user_id, order_id);""")
@@ -323,17 +344,17 @@ async def get_user(user_id):
 async def get_services():
     async with pool.acquire() as conn:
         return await conn.fetch(
-            "SELECT id, name, description, min_amount, owner_commission, executor_commission FROM services WHERE active=TRUE ORDER BY id"
+            "SELECT id, name, description, min_amount, owner_commission, executor_commission, payment_type FROM services WHERE active=TRUE ORDER BY id"
         )
 
 async def get_service(service_id):
     async with pool.acquire() as conn:
         return await conn.fetchrow(
-            "SELECT id, name, description, min_amount, owner_commission, executor_commission, active, max_amount FROM services WHERE id=$1",
+            "SELECT id, name, description, min_amount, owner_commission, executor_commission, active, max_amount, payment_type FROM services WHERE id=$1",
             service_id,
         )
 
-async def create_order(user_id, service_id, amount_rub, rate=None):
+async def create_order(user_id, service_id, amount_rub, rate=None, payment_method=None, payment_details=None, payment_file_id=None):
     """Create an order and reserve the full client payment in escrow."""
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -361,9 +382,11 @@ async def create_order(user_id, service_id, amount_rub, rate=None):
                 return None, "insufficient_balance"
             order_id = await conn.fetchval(
                 """INSERT INTO orders(user_id, service_id, amount_rub, exchange_rate, user_amount_usdt,
-                    total_amount_usdt, owner_commission_amount, executor_commission_amount, escrow_amount_usdt)
-                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$6) RETURNING id""",
-                user_id, service_id, amount_rub, rate, user_amount_usdt, total_amount_usdt, owner_amount, executor_amount)
+                    total_amount_usdt, owner_commission_amount, executor_commission_amount, escrow_amount_usdt,
+                    payment_method, payment_details, payment_file_id)
+                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$6,$9,$10,$11) RETURNING id""",
+                user_id, service_id, amount_rub, rate, user_amount_usdt, total_amount_usdt, owner_amount, executor_amount,
+                payment_method, payment_details, payment_file_id)
             await conn.execute("UPDATE users SET balance=balance-$1 WHERE user_id=$2", total_amount_usdt, user_id)
             await conn.execute("INSERT INTO transactions(user_id,order_id,amount,type,description) VALUES($1,$2,$3,'escrow_hold',$4)", user_id, order_id, -total_amount_usdt, f"Резерв по заявке #{order_id}")
             return order_id, "ok"
@@ -530,7 +553,7 @@ async def get_executor_active_order(executor_id):
         return await conn.fetchrow(
             """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
                       o.executor_commission_amount, o.status, o.created_at, o.completed_at, o.disputed_at,
-                      o.settlement_for, o.user_id
+                      o.settlement_for, o.user_id, o.payment_method, o.payment_details, o.payment_file_id
                FROM orders o JOIN services s ON s.id=o.service_id
                WHERE o.executor_id=$1 AND o.status IN ('in_progress','awaiting_confirmation','disputed')
                ORDER BY o.id DESC LIMIT 1""", executor_id
@@ -843,7 +866,7 @@ async def get_orders_by_status(status, limit=15):
         return await conn.fetch(
             """SELECT o.id, o.user_id, u.username, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
                       o.owner_commission_amount, o.executor_commission_amount, o.status,
-                      o.executor_id, o.created_at
+                      o.executor_id, o.created_at, o.payment_method, o.payment_details, o.payment_file_id
                FROM orders o
                JOIN services s ON s.id = o.service_id
                JOIN users u ON u.user_id = o.user_id

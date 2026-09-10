@@ -1,12 +1,13 @@
 import os
 import json
+import re
 from html import escape
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, TelegramObject
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, TelegramObject, BotCommand
 from aiohttp import web
 from dotenv import load_dotenv
 from .db import (
@@ -93,6 +94,7 @@ dp.callback_query.outer_middleware(AgreementMiddleware())
 
 class UserStates(StatesGroup):
     waiting_order_amount = State()
+    waiting_payment_details = State()
     executor_experience = State()
     executor_services = State()
     executor_comment = State()
@@ -439,7 +441,8 @@ async def service_select(c: CallbackQuery, state: FSMContext):
     await state.update_data(service_id=sid, service_name=service[1],
                            min_amount_usdt=float(service[3]),
                            owner_comm=float(service[4]),
-                           executor_comm=float(service[5]))
+                           executor_comm=float(service[5]),
+                           payment_type=service[8] if len(service) > 8 else 'phone')
     await state.set_state(UserStates.waiting_order_amount)
 
     min_rub = float(service[3]) * rate
@@ -470,52 +473,232 @@ async def order_amount(m: Message, state: FSMContext):
     except ValueError:
         await m.answer("Неверный формат. Пришлите сумму числом (например 300 или 150.50).")
         return
+    if amount_rub <= 0:
+        await m.answer("Сумма должна быть больше нуля.")
+        return
 
     data = await state.get_data()
-    # Курс фиксируется в момент создания заявки: один и тот же
-    # используется для проверки минимума, записи в БД и показа клиенту
     rate = get_exchange_rate()
     min_amount_usdt = float(data["min_amount_usdt"])
     min_rub = min_amount_usdt * rate
-
     if amount_rub < min_rub:
         await m.answer(f"❌ Минимальная сумма: {min_rub:.2f} RUB ({min_amount_usdt:.2f} USDT)")
         return
 
-    # Создаём заявку (курс передаём явно)
-    oid, create_error = await create_order(m.from_user.id, data["service_id"], amount_rub, rate)
-    if not oid:
-        await state.clear()
-        if create_error == "insufficient_balance":
-            await m.answer("❌ Недостаточно USDT на балансе для создания заявки. Пополните баланс и попробуйте снова.", reply_markup=back())
-        elif create_error == "below_minimum":
-            await m.answer("❌ Сумма ниже минимальной для этой услуги.", reply_markup=back())
-        elif create_error == "above_maximum":
-            await m.answer("❌ Сумма выше максимальной для этой услуги.", reply_markup=back())
+    # Сохраняем сумму в черновике. Заявка в БД и резерв средств появятся
+    # только после ввода и подтверждения реквизитов.
+    await state.update_data(amount_rub=amount_rub, rate=rate)
+    payment_type = data.get("payment_type", "phone")
+    if payment_type == "card":
+        prompt = (
+            "💳 <b>Номер карты</b>\n\n"
+            "Отправьте номер карты, на которую нужно перевести средства.\n"
+            "Можно с пробелами или без них."
+        )
+    elif payment_type == "qr":
+        prompt = (
+            "🧾 <b>QR-код для оплаты</b>\n\n"
+            "Отправьте <b>фотографию QR-кода</b> или <b>ссылку на QR/оплату СБП</b>.\n\n"
+            "Это один и тот же способ оплаты — можно выбрать любой из двух вариантов."
+        )
+    else:
+        label = "номер телефона для пополнения" if data.get("service_name", "").lower().find("мобиль") >= 0 else "номер телефона получателя для СБП"
+        prompt = (
+            "📱 <b>Номер телефона</b>\n\n"
+            f"Отправьте {label}.\n"
+            "Например: <code>+79991234567</code>"
+        )
+    await state.set_state(UserStates.waiting_payment_details)
+    await m.answer(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Изменить сумму", callback_data="order:back_amount")],
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="back")],
+    ]), parse_mode="HTML")
+
+
+def _payment_label(payment_type):
+    return {
+        "phone": "📱 Номер телефона",
+        "card": "💳 Номер карты",
+        "qr": "🧾 QR / ссылка на оплату",
+    }.get(payment_type, "Реквизиты")
+
+
+def _validate_payment_details(payment_type, message):
+    if payment_type == "qr":
+        if message.photo:
+            return {"method": "qr_photo", "details": None, "file_id": message.photo[-1].file_id}
+        if message.text:
+            value = message.text.strip()
+            if re.match(r"^https?://\S+$", value, re.IGNORECASE):
+                return {"method": "qr_link", "details": value, "file_id": None}
+        return None
+
+    if not message.text:
+        return None
+    value = message.text.strip()
+    digits = re.sub(r"\D", "", value)
+    if payment_type == "card":
+        if not 13 <= len(digits) <= 19:
+            return None
+        return {"method": "card", "details": digits, "file_id": None}
+
+    if not 7 <= len(digits) <= 15:
+        return None
+    return {"method": "phone", "details": value, "file_id": None}
+
+
+def _payment_confirmation_text(data):
+    payment_type = data.get("payment_type", "phone")
+    details = data.get("payment_details")
+    method = data.get("payment_method")
+    if method == "qr_photo":
+        details_text = "📷 Фотография QR-кода загружена"
+    elif method == "qr_link":
+        details_text = f"🔗 {escape(details or '')}"
+    elif payment_type == "card":
+        digits = re.sub(r"\D", "", details or "")
+        details_text = " ".join(digits[i:i+4] for i in range(0, len(digits), 4))
+    else:
+        details_text = escape(details or "")
+
+    amount_rub = float(data["amount_rub"])
+    rate = float(data["rate"])
+    user_amount_usdt = amount_rub / rate
+    commission_usdt, _, _ = calculate_order_commission(
+        user_amount_usdt, rate, float(data["owner_comm"]), float(data["executor_comm"])
+    )
+    total_amount_usdt = user_amount_usdt + commission_usdt
+    return (
+        f"🧾 <b>Проверьте данные заявки</b>\n\n"
+        f"Услуга: <b>{escape(data['service_name'])}</b>\n"
+        f"Сумма: <b>{amount_rub:.2f} RUB</b>\n"
+        f"К оплате: <b>{total_amount_usdt:.4f} USDT</b>\n\n"
+        f"{_payment_label(payment_type)}:\n<b>{details_text}</b>\n\n"
+        "⚠️ После подтверждения заявка будет передана исполнителям.\n"
+        "Проверьте реквизиты — после передачи изменить их нельзя."
+    )
+
+
+@dp.message(UserStates.waiting_payment_details)
+async def order_payment_details(m: Message, state: FSMContext):
+    data = await state.get_data()
+    payment_type = data.get("payment_type", "phone")
+    parsed = _validate_payment_details(payment_type, m)
+    if not parsed:
+        if payment_type == "card":
+            msg = "❌ Неверный номер карты. Пришлите 13–19 цифр, можно с пробелами."
+        elif payment_type == "qr":
+            msg = "❌ Отправьте фотографию QR-кода или ссылку, начинающуюся с http:// или https://."
         else:
-            await m.answer("❌ Не удалось создать заявку. Попробуйте ещё раз.", reply_markup=back())
+            msg = "❌ Неверный номер телефона. Пришлите номер из 7–15 цифр."
+        await m.answer(msg)
         return
 
-    # Финансовые значения считаются внутренне, но размеры комиссий
-    # никогда не показываются клиенту или исполнителю.
-    owner_comm = float(data["owner_comm"])
-    executor_comm = float(data["executor_comm"])
+    await state.update_data(
+        payment_method=parsed["method"],
+        payment_details=parsed["details"],
+        payment_file_id=parsed["file_id"],
+    )
+    data = await state.get_data()
+    await m.answer(
+        _payment_confirmation_text(data),
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Всё верно", callback_data="order:confirm_create")],
+            [InlineKeyboardButton(text="✏️ Изменить реквизиты", callback_data="order:edit_payment")],
+            [InlineKeyboardButton(text="⬅️ К услугам", callback_data="services")],
+        ]), parse_mode="HTML"
+    )
+
+
+@dp.callback_query(F.data == "order:edit_payment")
+async def order_edit_payment(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    if not data.get("payment_type"):
+        await c.answer("Черновик заявки не найден.", show_alert=True)
+        return
+    await state.set_state(UserStates.waiting_payment_details)
+    payment_type = data["payment_type"]
+    if payment_type == "card":
+        prompt = "💳 <b>Номер карты</b>\n\nОтправьте номер карты заново."
+    elif payment_type == "qr":
+        prompt = "🧾 <b>QR-код для оплаты</b>\n\nОтправьте фотографию QR-кода или ссылку на QR/оплату СБП."
+    else:
+        prompt = "📱 <b>Номер телефона</b>\n\nОтправьте номер телефона заново."
+    await c.message.edit_text(prompt, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="back")]
+    ]), parse_mode="HTML")
+    await c.answer()
+
+
+@dp.callback_query(F.data == "order:back_amount")
+async def order_back_amount(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    rate = get_exchange_rate()
+    min_rub = float(data.get("min_amount_usdt", 0)) * rate
+    await state.update_data(rate=rate)
+    await state.set_state(UserStates.waiting_order_amount)
+    await c.message.edit_text(
+        f"💰 <b>Сумма заявки</b>\n\nМинимальная сумма: <b>{min_rub:.2f} RUB</b>\n\n"
+        "Пришлите сумму в рублях (например 300 или 150.50):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ К услугам", callback_data="services")]]),
+        parse_mode="HTML"
+    )
+    await c.answer()
+
+
+@dp.callback_query(F.data == "order:confirm_create")
+async def order_confirm_create(c: CallbackQuery, state: FSMContext):
+    if await get_user_blocked(c.from_user.id):
+        await c.answer("Ваш аккаунт заблокирован.", show_alert=True)
+        await state.clear()
+        return
+    data = await state.get_data()
+    required = ("service_id", "service_name", "amount_rub", "rate", "payment_type", "payment_method")
+    if any(k not in data for k in required):
+        await c.answer("Черновик заявки устарел. Начните создание заявки заново.", show_alert=True)
+        await state.clear()
+        return
+
+    oid, create_error = await create_order(
+        c.from_user.id,
+        data["service_id"],
+        float(data["amount_rub"]),
+        float(data["rate"]),
+        data["payment_method"],
+        data.get("payment_details"),
+        data.get("payment_file_id"),
+    )
+    if not oid:
+        messages = {
+            "insufficient_balance": "❌ Недостаточно USDT на балансе для создания заявки. Пополните баланс и попробуйте снова.",
+            "below_minimum": "❌ Сумма ниже минимальной для этой услуги.",
+            "above_maximum": "❌ Сумма выше максимальной для этой услуги.",
+        }
+        await c.answer(messages.get(create_error, "❌ Не удалось создать заявку. Попробуйте ещё раз."), show_alert=True)
+        return
+
+    amount_rub = float(data["amount_rub"])
+    rate = float(data["rate"])
     user_amount_usdt = amount_rub / rate
-    commission_usdt, _owner_commission_amount, _executor_commission_amount = calculate_order_commission(
-        user_amount_usdt, rate, owner_comm, executor_comm
+    commission_usdt, _, _ = calculate_order_commission(
+        user_amount_usdt, rate, float(data["owner_comm"]), float(data["executor_comm"])
     )
     total_amount_usdt = user_amount_usdt + commission_usdt
 
     await state.clear()
-    await log_order_event(oid, m.from_user.id, "created", f"Заявка создана: {data['service_name']}")
-    await create_notification(m.from_user.id, "order", f"📋 Заявка #{oid} создана", "Заявка ожидает исполнителя.", oid)
-    await m.answer(
+    await log_order_event(oid, c.from_user.id, "created", f"Заявка создана: {data['service_name']}; реквизиты подтверждены клиентом")
+    await create_notification(c.from_user.id, "order", f"📋 Заявка #{oid} создана", "Заявка передана исполнителям.", oid)
+    await c.message.edit_text(
         f"🧾 <b>Заявка #{oid}</b>\n\n"
-        f"Услуга: {data['service_name']}\n\n"
-        f"<b>К оплате: {total_amount_usdt:.4f} USDT</b>\n"
-        f"Вы получите: <b>{amount_rub:.2f} RUB</b>\n\n"
-        f"Курс {rate:.2f} RUB/USDT зафиксирован. Ожидание исполнителя...",
-        reply_markup=back(), parse_mode="HTML")
+        f"Услуга: <b>{escape(data['service_name'])}</b>\n"
+        f"Сумма: <b>{amount_rub:.2f} RUB</b>\n"
+        f"К оплате: <b>{total_amount_usdt:.4f} USDT</b>\n\n"
+        f"Реквизиты подтверждены.\n"
+        f"Курс {rate:.2f} RUB/USDT зафиксирован.\n\n"
+        "⏳ <b>Ожидание исполнителя...</b>",
+        reply_markup=back(), parse_mode="HTML"
+    )
+    await c.answer("Заявка создана")
 
 @dp.callback_query(F.data.startswith("order:view:"))
 async def order_view(c: CallbackQuery):
@@ -523,7 +706,47 @@ async def order_view(c: CallbackQuery):
     o=await get_order(oid)
     if not o or o[1] != c.from_user.id:
         await c.answer("Заявка недоступна.", show_alert=True); return
-    await c.message.edit_text(f"📋 <b>Заявка #{oid}</b>\n\nСтатус: <b>{ORDER_STATUS_LABELS.get(o[9],o[9])}</b>\nСумма: <b>{float(o[4]):.2f} RUB</b>\nК оплате: <b>{float(o[7]):.4f} USDT</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Чат",callback_data=f"chat:open:{oid}")],[InlineKeyboardButton(text="⬅️ Мои заявки",callback_data="orders")]]), parse_mode="HTML")
+    payment_method = o[12]
+    payment_details = o[13]
+    payment_file_id = o[14]
+    if payment_method == "qr_photo":
+        payment_text = "🧾 QR / ссылка на оплату: 📷 Фото QR-кода"
+    elif payment_method == "qr_link":
+        payment_text = f"🧾 QR / ссылка на оплату: 🔗 {escape(payment_details or '')}"
+    elif payment_method == "card":
+        payment_text = f"💳 Номер карты: <code>{escape(payment_details or '')}</code>"
+    elif payment_method == "phone":
+        payment_text = f"📱 Номер телефона: <code>{escape(payment_details or '')}</code>"
+    else:
+        payment_text = "Реквизиты: —"
+    rows = []
+    if payment_file_id and payment_method == "qr_photo":
+        rows.append([InlineKeyboardButton(text="📷 Показать QR-код", callback_data=f"order:showqr:{oid}")])
+    if o[9] in ("in_progress", "awaiting_confirmation", "disputed"):
+        rows.append([InlineKeyboardButton(text="💬 Чат",callback_data=f"chat:open:{oid}")])
+    rows.append([InlineKeyboardButton(text="⬅️ Мои заявки",callback_data="orders")])
+    await c.message.edit_text(
+        f"📋 <b>Заявка #{oid}</b>\n\n"
+        f"Статус: <b>{ORDER_STATUS_LABELS.get(o[9],o[9])}</b>\n"
+        f"Сумма: <b>{float(o[4]):.2f} RUB</b>\n"
+        f"К оплате: <b>{float(o[6]):.4f} USDT</b>\n\n"
+        f"{payment_text}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("order:showqr:"))
+async def order_show_qr(c: CallbackQuery):
+    oid = int(c.data.split(":")[2])
+    o = await get_order(oid)
+    if not o or o[1] != c.from_user.id or o[14] is None:
+        await c.answer("QR-код недоступен.", show_alert=True)
+        return
+    await c.bot.send_photo(
+        c.from_user.id,
+        o[14],
+        caption=f"🧾 QR-код по заявке #{oid}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ К заявке", callback_data=f"order:view:{oid}")]])
+    )
     await c.answer()
 
 @dp.callback_query(F.data == "orders")
@@ -771,9 +994,15 @@ async def executor_claim(c: CallbackQuery):
     if result != "ok":
         msgs={'unavailable':'Вы недоступны для новых заявок.','active_exists':'У вас уже есть активная заявка.','already_taken':'Заявка уже взята другим исполнителем.','own_order':'Нельзя взять собственную заявку.','not_found':'Заявка не найдена.'}
         await c.answer(msgs.get(result,'Не удалось взять заявку.'),show_alert=True); return
-    await c.answer("Заявка взята.",show_alert=True)
-    await log_order_event(oid, c.from_user.id, "claimed", "Исполнитель взял заявку")
+    await c.answer("Заявка взята. Реквизиты доступны в активной заявке.",show_alert=True)
+    await log_order_event(oid, c.from_user.id, "claimed", "Исполнитель взял заявку и получил доступ к реквизитам")
     await create_notification(client_id, "order", f"👷 Исполнитель найден по заявке #{oid}", "Заявка принята исполнителем.", oid)
+    active_order = await get_executor_active_order(c.from_user.id)
+    if active_order and active_order[12] == "qr_photo" and active_order[14]:
+        try:
+            await c.bot.send_photo(c.from_user.id, active_order[14], caption=f"🧾 QR-код по заявке #{oid}")
+        except Exception as e:
+            print(f"[QR claim notify] {e}")
     try:
         await c.bot.send_message(client_id, f"👷 <b>Исполнитель найден</b>\n\nВаша заявка #{oid} принята исполнителем.\nТеперь вы можете общаться через анонимный чат TornadoPay.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Открыть чат",callback_data=f"chat:open:{oid}")]]), parse_mode="HTML")
     except Exception as e: print(f"[Notify claim] {e}")
@@ -861,20 +1090,48 @@ async def executor_active(c: CallbackQuery):
         await c.answer("Активной заявки нет.", show_alert=True)
         return
     status = ORDER_STATUS_LABELS.get(o[6], o[6])
+    payment_method, payment_details, payment_file_id = o[12], o[13], o[14]
+    if payment_method == "qr_photo":
+        payment_text = "🧾 <b>QR / ссылка на оплату:</b> 📷 Фото QR-кода"
+    elif payment_method == "qr_link":
+        payment_text = f"🧾 <b>QR / ссылка на оплату:</b> 🔗 {escape(payment_details or '')}"
+    elif payment_method == "card":
+        payment_text = f"💳 <b>Номер карты:</b> <code>{escape(payment_details or '')}</code>"
+    else:
+        payment_text = f"📱 <b>Номер телефона:</b> <code>{escape(payment_details or '')}</code>"
     text = (f"🔧 <b>Активная заявка #{o[0]}</b>\n\n"
             f"Услуга: <b>{escape(o[1])}</b>\n"
             f"Вы переводите: <b>{float(o[2]):.2f} RUB</b>\n"
             f"На баланс получите: <b>{(float(o[3]) + float(o[5])):.4f} USDT</b>\n"
-            f"Статус: {status}")
+            f"Статус: {status}\n\n"
+            f"{payment_text}")
     rows=[]
     if o[6] in ("in_progress", "awaiting_confirmation", "disputed"):
         unread = await get_chat_unread_count(o[0], c.from_user.id)
         label = f"💬 Открыть чат 🔴 {unread}" if unread else "💬 Открыть чат"
         rows.append([InlineKeyboardButton(text=label, callback_data=f"chat:open:{o[0]}")])
+    if payment_file_id and payment_method == "qr_photo":
+        rows.append([InlineKeyboardButton(text="📷 Показать QR-код", callback_data=f"exec:showqr:{o[0]}")])
     if o[6] == "in_progress":
         rows.append([InlineKeyboardButton(text="✅ Отметить выполненной", callback_data=f"exec:done:{o[0]}")])
     rows.append([InlineKeyboardButton(text="⬅️ ЛК Исполнителя", callback_data="executor")])
     await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML")
+    await c.answer()
+
+
+@dp.callback_query(F.data.startswith("exec:showqr:"))
+async def executor_show_qr(c: CallbackQuery):
+    oid = int(c.data.split(":")[2])
+    o = await get_executor_active_order(c.from_user.id)
+    if not o or int(o[0]) != oid or o[12] != "qr_photo" or not o[14]:
+        await c.answer("QR-код недоступен.", show_alert=True)
+        return
+    await c.bot.send_photo(
+        c.from_user.id,
+        o[14],
+        caption=f"🧾 QR-код по заявке #{oid}",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Активная заявка", callback_data="exec:active")]])
+    )
     await c.answer()
 
 @dp.callback_query(F.data == "exec:history")
@@ -1101,6 +1358,11 @@ async def main():
     asyncio.create_task(start_exchange_rate_updater())
 
     bot = Bot(TOKEN)
+    # Кнопка-меню команд слева от поля ввода (рядом со скрепкой) — берётся
+    # из этого списка. Без него в интерфейсе Telegram она не показывается.
+    await bot.set_my_commands([
+        BotCommand(command="start", description="Открыть главное меню"),
+    ])
     webhook_runner = await start_xrocket_webhook_server(bot)
     try:
         await dp.start_polling(bot)
