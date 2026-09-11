@@ -32,6 +32,12 @@ EXCHANGE_RATE_MARKUP_PERCENT: float = float(os.getenv("EXCHANGE_RATE_MARKUP_PERC
 # комиссиям, заданным у конкретной услуги.
 MIN_TOTAL_COMMISSION_RUB: float = 25.0
 
+# Фиксированная надбавка за привязку карты для услуги «Карта под оплату».
+# Делится поровну между сервисом и исполнителем.
+CARD_BINDING_FEE_TOTAL_USDT: float = 1.0
+CARD_BINDING_FEE_OWNER_USDT: float = 0.5
+CARD_BINDING_FEE_EXECUTOR_USDT: float = 0.5
+
 def calculate_order_commission(user_amount_usdt, rate, owner_commission, executor_commission):
     """Рассчитать общую комиссию и её доли.
 
@@ -308,6 +314,7 @@ async def init_db():
         # CVV/CVC и OTP/СМС-коды бот не запрашивает и не сохраняет.
         await _add_column_if_missing(conn, "orders", "executor_card_reference", "TEXT")
         await _add_column_if_missing(conn, "orders", "executor_card_encrypted", "TEXT")
+        await _add_column_if_missing(conn, "orders", "card_binding_requested", "BOOLEAN NOT NULL DEFAULT FALSE")
 
         # V16: фиксированный каталог из четырёх услуг и способ реквизитов.
         # Существующие данные не удаляем: недостающие услуги добавляются,
@@ -388,7 +395,7 @@ async def get_service(service_id):
             service_id,
         )
 
-async def create_order(user_id, service_id, amount_rub, rate=None, payment_method=None, payment_details=None, payment_file_id=None, order_comment=""):
+async def create_order(user_id, service_id, amount_rub, rate=None, payment_method=None, payment_details=None, payment_file_id=None, order_comment="", card_binding_requested=False):
     """Create an order and reserve the full client payment in escrow."""
     async with pool.acquire() as conn:
         async with conn.transaction():
@@ -408,7 +415,10 @@ async def create_order(user_id, service_id, amount_rub, rate=None, payment_metho
             commission_usdt, owner_amount, executor_amount = calculate_order_commission(
                 user_amount_usdt, rate, owner_comm, executor_comm
             )
-            total_amount_usdt = user_amount_usdt + commission_usdt
+            if card_binding_requested:
+                owner_amount += CARD_BINDING_FEE_OWNER_USDT
+                executor_amount += CARD_BINDING_FEE_EXECUTOR_USDT
+            total_amount_usdt = user_amount_usdt + owner_amount + executor_amount
             balance = await conn.fetchval("SELECT balance FROM users WHERE user_id=$1 FOR UPDATE", user_id)
             if balance is None:
                 return None, "user_not_found"
@@ -417,10 +427,10 @@ async def create_order(user_id, service_id, amount_rub, rate=None, payment_metho
             order_id = await conn.fetchval(
                 """INSERT INTO orders(user_id, service_id, amount_rub, exchange_rate, user_amount_usdt,
                     total_amount_usdt, owner_commission_amount, executor_commission_amount, escrow_amount_usdt,
-                    payment_method, payment_details, payment_file_id, order_comment)
-                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$6,$9,$10,$11,$12) RETURNING id""",
+                    payment_method, payment_details, payment_file_id, order_comment, card_binding_requested)
+                   VALUES($1,$2,$3,$4,$5,$6,$7,$8,$6,$9,$10,$11,$12,$13) RETURNING id""",
                 user_id, service_id, amount_rub, rate, user_amount_usdt, total_amount_usdt, owner_amount, executor_amount,
-                payment_method, payment_details, payment_file_id, (order_comment or "")[:1000])
+                payment_method, payment_details, payment_file_id, (order_comment or "")[:1000], bool(card_binding_requested))
             await conn.execute("UPDATE users SET balance=balance-$1 WHERE user_id=$2", total_amount_usdt, user_id)
             await conn.execute("INSERT INTO transactions(user_id,order_id,amount,type,description) VALUES($1,$2,$3,'escrow_hold',$4)", user_id, order_id, -total_amount_usdt, f"Резерв по заявке #{order_id}")
             return order_id, "ok"
@@ -497,7 +507,7 @@ async def get_free_orders(limit=20):
     async with pool.acquire() as conn:
         return await conn.fetch(
             """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt,
-                      o.executor_commission_amount, o.created_at, o.order_comment
+                      o.executor_commission_amount, o.created_at, o.order_comment, o.card_binding_requested
                FROM orders o
                JOIN services s ON s.id = o.service_id
                WHERE o.status='new' AND o.executor_id IS NULL
@@ -680,7 +690,8 @@ async def get_executor_active_order(executor_id):
         return await conn.fetchrow(
             """SELECT o.id, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
                       o.executor_commission_amount, o.status, o.created_at, o.completed_at, o.disputed_at,
-                      o.settlement_for, o.user_id, o.payment_method, o.payment_details, o.payment_file_id, o.order_comment
+                      o.settlement_for, o.user_id, o.payment_method, o.payment_details, o.payment_file_id, o.order_comment,
+                      o.card_binding_requested
                FROM orders o JOIN services s ON s.id=o.service_id
                WHERE o.executor_id=$1 AND o.status IN ('in_progress','awaiting_confirmation','disputed')
                ORDER BY o.id DESC LIMIT 1""", executor_id
@@ -1045,7 +1056,8 @@ async def get_order(order_id):
         return await conn.fetchrow(
             """SELECT o.id, o.user_id, u.username, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
                       o.owner_commission_amount, o.executor_commission_amount, o.status,
-                      o.executor_id, o.created_at, o.payment_method, o.payment_details, o.payment_file_id, o.order_comment
+                      o.executor_id, o.created_at, o.payment_method, o.payment_details, o.payment_file_id, o.order_comment,
+                      o.card_binding_requested
                FROM orders o
                JOIN services s ON s.id = o.service_id
                JOIN users u ON u.user_id = o.user_id
@@ -1336,8 +1348,11 @@ async def get_order_evidence(order_id, limit=50):
 async def create_notification(user_id, kind, title, body='', order_id=None):
     return await pool.fetchval("INSERT INTO notifications(user_id,order_id,kind,title,body) VALUES($1,$2,$3,$4,$5) RETURNING id", user_id, order_id, kind, title[:200], body[:2000])
 
-async def get_notifications(user_id, limit=30):
-    return await pool.fetch("SELECT id,order_id,kind,title,body,read_at,created_at FROM notifications WHERE user_id=$1 ORDER BY id DESC LIMIT $2", user_id, limit)
+async def get_notifications(user_id, limit=30, offset=0):
+    return await pool.fetch("SELECT id,order_id,kind,title,body,read_at,created_at FROM notifications WHERE user_id=$1 ORDER BY id DESC LIMIT $2 OFFSET $3", user_id, limit, offset)
+
+async def get_notifications_count(user_id):
+    return await pool.fetchval("SELECT COUNT(*) FROM notifications WHERE user_id=$1", user_id)
 
 async def get_unread_notifications_count(user_id):
     return await pool.fetchval("SELECT COUNT(*) FROM notifications WHERE user_id=$1 AND read_at IS NULL", user_id)

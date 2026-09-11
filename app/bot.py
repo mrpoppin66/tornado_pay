@@ -12,6 +12,7 @@ from aiohttp import web
 from dotenv import load_dotenv
 from .db import (
     init_db, close_db, ensure_user, get_user, get_services, get_service, create_order, calculate_order_commission,
+    CARD_BINDING_FEE_TOTAL_USDT, CARD_BINDING_FEE_OWNER_USDT, CARD_BINDING_FEE_EXECUTOR_USDT,
     get_orders, ORDER_STATUS_LABELS, get_exchange_rate, start_exchange_rate_updater,
     get_active_executor_application, get_latest_executor_application, get_available_executors,
     set_executor_notify_enabled,
@@ -22,7 +23,8 @@ from .db import (
     set_executor_card_details, get_executor_card_details, set_executor_card_reference, get_executor_card_reference,
     create_withdrawal_request, get_user_transactions, get_chat_unread_count, get_chat_unread_for_orders,
     mark_chat_read, get_recent_chat_messages, get_executor_detailed_stats,
-    add_order_evidence, log_order_event, create_notification, get_notifications, get_unread_notifications_count, mark_notifications_read,
+    add_order_evidence, log_order_event, create_notification, get_notifications, get_notifications_count,
+    get_unread_notifications_count, mark_notifications_read,
     get_order_events, get_order_evidence, set_user_blocked, get_executor_profile, get_executor_history_detailed, get_user_blocked,
     get_user_agreement_accepted, accept_user_agreement,
     create_deposit, get_deposit_by_invoice, mark_deposit_paid, mark_deposit_expired,
@@ -194,6 +196,7 @@ dp.callback_query.outer_middleware(SubscriptionMiddleware())
 
 class UserStates(StatesGroup):
     waiting_order_amount = State()
+    waiting_card_binding = State()
     waiting_order_comment = State()
     waiting_payment_details = State()
     executor_experience = State()
@@ -274,7 +277,8 @@ def chat_kb(order_id):
 
 async def notify_available_executors_new_order(bot: Bot, order_id: int, service_name: str,
                                                 amount_rub: float, payout_usdt: float,
-                                                order_comment: str = "", exclude_user_id: int | None = None):
+                                                order_comment: str = "", exclude_user_id: int | None = None,
+                                                card_binding_requested: bool | None = None):
     """Рассылает уведомление о новой свободной заявке всем исполнителям со
     статусом «Доступен». Взять заявку сможет только один из них — атомарная
     проверка происходит в claim_order при нажатии кнопки."""
@@ -282,10 +286,17 @@ async def notify_available_executors_new_order(bot: Bot, order_id: int, service_
     if not executors:
         return
     comment_line = f"\nКомментарий: <b>{escape(order_comment)}</b>" if order_comment else ""
+    binding_line = ""
+    if card_binding_requested is not None and "Карта под оплату" in str(service_name):
+        binding_line = (
+            f"\n🔗 Привязка карты: <b>нужна (+{CARD_BINDING_FEE_EXECUTOR_USDT:.1f} USDT)</b>" if card_binding_requested
+            else "\n🔗 Привязка карты: <b>не нужна</b>"
+        )
     text = (
         f"🆕 <b>Новая заявка #{order_id}</b>\n\n"
         f"Услуга: <b>{escape(service_name)}</b>\n"
         f"Переводите: <b>{amount_rub:.2f} RUB</b> → получите: <b>{payout_usdt:.4f} USDT</b>"
+        f"{binding_line}"
         f"{comment_line}"
     )
     kb = InlineKeyboardMarkup(inline_keyboard=[
@@ -661,17 +672,16 @@ async def order_amount(m: Message, state: FSMContext):
     await state.update_data(amount_rub=amount_rub, rate=rate)
     payment_type = data.get("payment_type", "phone")
 
-    # Комментарий нужен только для услуги «Карта под оплату».
+    # «Карта под оплату»: после суммы сначала спрашиваем про привязку карты, затем комментарий.
     if payment_type == "executor_card":
-        await state.set_state(UserStates.waiting_order_comment)
+        await state.set_state(UserStates.waiting_card_binding)
         await m.answer(
-            "📝 <b>Комментарий к оплате</b>\n\n"
-            "Напишите, <b>за что нужно произвести оплату</b>. Например:\n"
-            "• подписка на сервис\n"
-            "• покупка в интернет-магазине\n"
-            "• оплата заказа / услуги\n\n"
-            "Комментарий увидит исполнитель.",
+            "🔗 <b>Нужна ли привязка карты?</b>\n\n"
+            f"Если привязка нужна, к оплате будет добавлено {CARD_BINDING_FEE_TOTAL_USDT:.1f} USDT "
+            f"({CARD_BINDING_FEE_OWNER_USDT:.1f} USDT сервису и {CARD_BINDING_FEE_EXECUTOR_USDT:.1f} USDT исполнителю).",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✅ Да", callback_data="card_binding:yes"),
+                 InlineKeyboardButton(text="❌ Нет", callback_data="card_binding:no")],
                 [InlineKeyboardButton(text="⬅️ Изменить сумму", callback_data="order:back_amount")],
                 [InlineKeyboardButton(text="❌ Отменить", callback_data="back")],
             ]), parse_mode="HTML"
@@ -704,6 +714,25 @@ async def order_amount(m: Message, state: FSMContext):
         [InlineKeyboardButton(text="❌ Отменить", callback_data="back")],
     ]), parse_mode="HTML")
 
+@dp.callback_query(UserStates.waiting_card_binding, F.data.startswith("card_binding:"))
+async def order_card_binding(c: CallbackQuery, state: FSMContext):
+    binding_requested = c.data.split(":")[1] == "yes"
+    await state.update_data(card_binding_requested=binding_requested)
+    await state.set_state(UserStates.waiting_order_comment)
+    await c.message.edit_text(
+        "📝 <b>Комментарий к оплате</b>\n\n"
+        "Напишите, <b>за что нужно произвести оплату</b>. Например:\n"
+        "• подписка на сервис\n"
+        "• покупка в интернет-магазине\n"
+        "• оплата заказа / услуги\n\n"
+        "Комментарий увидит исполнитель.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Изменить сумму", callback_data="order:back_amount")],
+            [InlineKeyboardButton(text="❌ Отменить", callback_data="back")],
+        ]), parse_mode="HTML"
+    )
+    await c.answer()
+
 @dp.message(UserStates.waiting_order_comment)
 async def order_comment(m: Message, state: FSMContext):
     if not m.text:
@@ -721,11 +750,12 @@ async def order_comment(m: Message, state: FSMContext):
     await state.update_data(order_comment=comment)
     payment_type = data.get("payment_type", "phone")
 
-    # «Карта под оплату»: после суммы и комментария заявка создаётся сразу.
+    # «Карта под оплату»: после суммы, привязки и комментария заявка создаётся сразу.
     if payment_type == "executor_card":
+        card_binding_requested = bool(data.get("card_binding_requested"))
         oid, create_error = await create_order(
             m.from_user.id, data["service_id"], float(data["amount_rub"]), float(data["rate"]),
-            None, None, None, comment
+            None, None, None, comment, card_binding_requested
         )
         if not oid:
             messages = {
@@ -738,18 +768,25 @@ async def order_comment(m: Message, state: FSMContext):
         amount_rub = float(data["amount_rub"]); rate = float(data["rate"])
         user_amount_usdt = amount_rub / rate
         commission_usdt, owner_amount, executor_amount = calculate_order_commission(user_amount_usdt, rate, float(data["owner_comm"]), float(data["executor_comm"]))
-        total_amount_usdt = user_amount_usdt + commission_usdt
+        if card_binding_requested:
+            owner_amount += CARD_BINDING_FEE_OWNER_USDT
+            executor_amount += CARD_BINDING_FEE_EXECUTOR_USDT
+        total_amount_usdt = user_amount_usdt + owner_amount + executor_amount
         await state.clear()
         await log_order_event(oid, m.from_user.id, "created", "Заявка «Карта под оплату» создана после ввода суммы и комментария")
         await create_notification(m.from_user.id, "order", f"📋 Заявка #{oid} создана", "Заявка передана исполнителям.", oid)
         await notify_available_executors_new_order(
             m.bot, oid, data["service_name"], amount_rub, user_amount_usdt + executor_amount,
-            comment, exclude_user_id=m.from_user.id
+            comment, exclude_user_id=m.from_user.id, card_binding_requested=card_binding_requested
+        )
+        binding_line = (
+            f"🔗 Привязка карты: <b>{'нужна (+' + f'{CARD_BINDING_FEE_TOTAL_USDT:.1f}' + ' USDT)' if card_binding_requested else 'не нужна'}</b>\n"
         )
         await m.answer(
             f"🧾 <b>Заявка #{oid}</b>\n\n"
             f"Услуга: <b>{escape(data['service_name'])}</b>\n"
             f"Сумма: <b>{amount_rub:.2f} RUB</b>\n"
+            f"{binding_line}"
             f"К оплате: <b>{total_amount_usdt:.4f} USDT</b>\n"
             f"Комментарий: <b>{escape(comment) if comment else '—'}</b>\n\n"
             f"Курс {rate:.2f} RUB/USDT зафиксирован.\n\n"
@@ -925,7 +962,7 @@ async def order_back_amount(c: CallbackQuery, state: FSMContext):
     rate = get_exchange_rate()
     min_rub = float(data.get("min_amount_usdt", 0)) * rate
     await state.update_data(rate=rate)
-    await state.update_data(order_comment=None, payment_method=None, payment_details=None, payment_file_id=None)
+    await state.update_data(order_comment=None, payment_method=None, payment_details=None, payment_file_id=None, card_binding_requested=False)
     await state.set_state(UserStates.waiting_order_amount)
     await c.message.edit_text(
         f"💰 <b>Сумма заявки</b>\n\nМинимальная сумма: <b>{min_rub:.2f} RUB</b>\n\n"
@@ -1269,9 +1306,15 @@ async def executor_free_orders(c: CallbackQuery):
     else:
         for r in rows:
             comment_line = f"Комментарий: <b>{escape(r[6])}</b>\n" if r[6] else ""
+            binding_line = ""
+            if "Карта под оплату" in str(r[1]):
+                binding_line = (
+                    f"🔗 Привязка: <b>нужна (+{CARD_BINDING_FEE_EXECUTOR_USDT:.1f} USDT)</b>\n" if r[7]
+                    else "🔗 Привязка: <b>не нужна</b>\n"
+                )
             text += (f"#{r[0]} — {escape(r[1])}\n"
                      f"Переводите: <b>{float(r[2]):.2f} RUB</b> → получите: <b>{(float(r[3])+float(r[4])):.4f} USDT</b>\n"
-                     f"{comment_line}\n")
+                     f"{binding_line}{comment_line}\n")
             kb.append([InlineKeyboardButton(text=f"Открыть #{r[0]}", callback_data=f"exec:order:{r[0]}")])
     kb.append([InlineKeyboardButton(text="⬅️ ЛК Исполнителя", callback_data="executor")])
     await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
@@ -1286,11 +1329,17 @@ async def executor_order_detail(c: CallbackQuery):
         await c.answer("Заявка уже недоступна.",show_alert=True); return
     extra = "\n\n💳 После взятия заявки отправьте данные своей карты пользователю через анонимный чат. Бот не запрашивает и не сохраняет данные карты." if "Карта под оплату" in str(r[1]) else ""
     comment_line = f"\n\n📝 <b>Комментарий:</b> {escape(r[6])}" if r[6] else ""
+    binding_line = ""
+    if "Карта под оплату" in str(r[1]):
+        binding_line = (
+            f"\n🔗 <b>Привязка карты:</b> нужна (+{CARD_BINDING_FEE_EXECUTOR_USDT:.1f} USDT) " if r[7]
+            else "\n🔗 <b>Привязка карты:</b> не нужна"
+        )
     text=(f"🆕 <b>Заявка #{r[0]}</b>\n\n"
           f"Услуга: <b>{escape(r[1])}</b>\n\n"
           f"Вы переводите: <b>{float(r[2]):.2f} RUB</b>\n"
           f"Получите на баланс: <b>{(float(r[3])+float(r[4])):.4f} USDT</b>"
-          + comment_line + extra)
+          + binding_line + comment_line + extra)
     kb=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Взять заявку",callback_data=f"exec:claim:{oid}")],[InlineKeyboardButton(text="⬅️ Свободные заявки",callback_data="exec:free")]])
     await c.message.edit_text(text,reply_markup=kb,parse_mode="HTML"); await c.answer()
 
@@ -1470,10 +1519,17 @@ async def executor_active(c: CallbackQuery):
         payment_text = f"💳 <b>Номер карты:</b> <code>{escape(payment_details or '')}</code>"
     else:
         payment_text = f"📱 <b>Номер телефона:</b> <code>{escape(payment_details or '')}</code>"
+    binding_line = ""
+    if "Карта под оплату" in str(o[1]):
+        binding_line = (
+            f"🔗 Привязка карты: <b>нужна (+{CARD_BINDING_FEE_EXECUTOR_USDT:.1f} USDT)</b>\n" if o[16]
+            else "🔗 Привязка карты: <b>не нужна</b>\n"
+        )
     text = (f"🔧 <b>Активная заявка #{o[0]}</b>\n\n"
             f"Услуга: <b>{escape(o[1])}</b>\n"
             f"Вы переводите: <b>{float(o[2]):.2f} RUB</b>\n"
             f"На баланс получите: <b>{(float(o[3]) + float(o[5])):.4f} USDT</b>\n"
+            f"{binding_line}"
             f"Комментарий: <b>{escape(o[15] or '—')}</b>\n"
             f"Статус: {status}\n\n"
             f"{payment_text}")
@@ -1614,22 +1670,43 @@ async def executor_notify_toggle(c: CallbackQuery):
         reply_markup=executor_cabinet_kb(bool(u[7]), bool(active), value), parse_mode="HTML")
     await c.answer("Уведомления о новых заявках " + ("включены" if value else "выключены"))
 
-@dp.callback_query(F.data == "notifications")
-async def notifications(c: CallbackQuery):
-    rows = await get_notifications(c.from_user.id, 30)
-    await mark_notifications_read(c.from_user.id)
-    text = "🔔 <b>Уведомления</b>\n\n"
-    kb=[]
+NOTIFICATIONS_PAGE_SIZE = 5
+
+async def render_notifications_page(c: CallbackQuery, page: int):
+    total = await get_notifications_count(c.from_user.id)
+    total_pages = max(1, (total + NOTIFICATIONS_PAGE_SIZE - 1) // NOTIFICATIONS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    rows = await get_notifications(c.from_user.id, NOTIFICATIONS_PAGE_SIZE, page * NOTIFICATIONS_PAGE_SIZE)
+    text = f"🔔 <b>Уведомления</b> (стр. {page + 1}/{total_pages})\n\n"
+    kb = []
     if not rows:
         text += "Уведомлений пока нет."
     else:
         for x in rows:
-            when=x[6].strftime("%d.%m %H:%M")
+            when = x[6].strftime("%d.%m %H:%M")
             text += f"<b>{escape(x[3])}</b> — {escape(x[4])}\n{when}\n\n"
             if x[1]:
                 kb.append([InlineKeyboardButton(text=f"📋 Заявка #{x[1]}", callback_data=f"order:view:{x[1]}")])
+    nav_row = []
+    if page > 0:
+        nav_row.append(InlineKeyboardButton(text="◀️ Назад", callback_data=f"notifications:page:{page - 1}"))
+    if page < total_pages - 1:
+        nav_row.append(InlineKeyboardButton(text="Вперёд ▶️", callback_data=f"notifications:page:{page + 1}"))
+    if nav_row:
+        kb.append(nav_row)
     kb.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back")])
     await safe_edit(c, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb))
+
+@dp.callback_query(F.data == "notifications")
+async def notifications(c: CallbackQuery):
+    await mark_notifications_read(c.from_user.id)
+    await render_notifications_page(c, 0)
+    await c.answer()
+
+@dp.callback_query(F.data.startswith("notifications:page:"))
+async def notifications_page(c: CallbackQuery):
+    page = int(c.data.split(":")[2])
+    await render_notifications_page(c, page)
     await c.answer()
 
 @dp.callback_query(F.data == "support")
