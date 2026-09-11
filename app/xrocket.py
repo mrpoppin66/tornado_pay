@@ -3,7 +3,7 @@ import hashlib, hmac, os, time, uuid
 import aiohttp
 
 # XROCKET_API_TOKEN is preferred. XROCKET_API_KEY is kept as a compatibility alias.
-XROCKET_API_TOKEN = os.getenv("XROCKET_API_TOKEN") or os.getenv("XROCKET_API_KEY", "")
+XROCKET_API_TOKEN = os.getenv("XROCKET_API_TOKEN", "").strip()
 XROCKET_WEBHOOK_SECRET = os.getenv("XROCKET_WEBHOOK_SECRET", "")
 XROCKET_BASE_URL = os.getenv("XROCKET_BASE_URL", "https://pay.api.xrocket.exchange").rstrip("/")
 DEPOSIT_CURRENCY = os.getenv("XROCKET_DEPOSIT_CURRENCY", "USDT")
@@ -28,10 +28,17 @@ async def _request(method, path, *, json=None, params=None):
                     or data.get("type")
                     or f"HTTP {r.status}"
                 )
+                problem_type = data.get("type")
                 kind = data.get("kind")
-                if kind and str(kind) not in str(msg):
-                    msg = f"{msg} [{kind}]"
-                raise XRocketError(str(msg))
+                instance = data.get("instance")
+                parts = [str(msg)]
+                if problem_type and problem_type != msg:
+                    parts.append(f"type={problem_type}")
+                if kind:
+                    parts.append(f"kind={kind}")
+                if instance:
+                    parts.append(f"instance={instance}")
+                raise XRocketError(f"HTTP {r.status}: " + " | ".join(parts))
             return data
 
 def _normalize_invoice(x):
@@ -108,6 +115,21 @@ async def create_cheque(amount, telegram_user_id, description="", client_cheque_
     data["id"] = data.get("chequeId", data.get("id"))
     data["link"] = links.get("telegramMiniAppLink") or data.get("url") or ""
     data["clientChequeId"] = data.get("clientChequeId", cid)
+    return data
+
+async def get_cheque(cheque_id=None, client_cheque_id=None):
+    params = {}
+    if cheque_id:
+        params["chequeId"] = str(cheque_id)
+    if client_cheque_id:
+        params["clientChequeId"] = str(client_cheque_id)
+    if not params:
+        raise XRocketError("Не указан chequeId или clientChequeId")
+    data = await _request("GET", "/api/v1/cheque", params=params)
+    if isinstance(data, dict):
+        links = data.get("links") or {}
+        data["id"] = data.get("chequeId", data.get("id"))
+        data["link"] = links.get("telegramMiniAppLink") or data.get("url") or data.get("link") or ""
     return data
 
 async def create_withdrawal(amount, address, network):

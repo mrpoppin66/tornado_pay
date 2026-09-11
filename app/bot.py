@@ -1675,9 +1675,16 @@ async def executor_withdraw_amount(m: Message, state: FSMContext):
         # Не возвращаем деньги автоматически: заявка становится error и остаётся
         # доступной админу для возврата или повторной выплаты.
         await mark_withdrawal_error(wid, f"{provider} error: {str(e)[:500]}")
+        # Средства остаются зарезервированными во внутренней заявке до решения
+        # администратора. Не сообщаем пользователю, что они уже возвращены.
+        reason = str(e).replace("\n", " ")[:700]
         await m.answer(
-            f"❌ Не удалось создать чек {('CryptoBot' if provider=='cryptobot' else 'xRocket')}. Средства возвращены на баланс.",
-            reply_markup=back())
+            f"❌ Не удалось создать чек {('CryptoBot' if provider=='cryptobot' else 'xRocket')}.\n\n"
+            f"Заявка #{wid} передана в обработку администратору. Средства пока зарезервированы.\n\n"
+            f"Причина: <code>{reason}</code>",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ ЛК Исполнителя", callback_data="executor")]
+            ]), parse_mode="HTML")
 
 @dp.callback_query(F.data.startswith("exec:availability:"))
 async def executor_availability(c: CallbackQuery):
@@ -1890,10 +1897,10 @@ async def _xrocket_webhook_handler(request):
 
 async def start_xrocket_webhook_server(bot_instance: Bot):
     """Поднимает отдельный HTTP-сервер для приёма вебхуков xRocket Pay,
-    параллельно с long polling бота. Если XROCKET_API_KEY не задан —
+    параллельно с long polling бота. Если XROCKET_API_TOKEN не задан —
     сервер не запускается (интеграция просто выключена)."""
     if not xrocket.is_configured():
-        print("[xrocket] XROCKET_API_KEY не задан — сервер вебхуков не запущен.")
+        print("[xrocket] XROCKET_API_TOKEN не задан — сервер вебхуков не запущен.")
         return None
     app = web.Application()
     app["bot"] = bot_instance
