@@ -79,6 +79,7 @@ class AdminStates(StatesGroup):
     waiting_emoji_probe = State()
     cash_amount = State()
     cash_withdraw_address = State()
+    cash_withdraw_network = State()
 
 
 def parse_positive_number(text):
@@ -113,12 +114,11 @@ async def _cash_balances_text():
         lines.append("🤖 <b>CryptoBot:</b> " + (", ".join(vals) + " USDT" if vals else "USDT: 0 / нет данных"))
     except Exception as e: lines.append(f"🤖 <b>CryptoBot:</b> ❌ {escape(str(e))}")
     try:
-        info=await xrocket.get_app_info() if xrocket.is_configured() else {}
-        balances=info.get("balances", []) if isinstance(info,dict) else []
+        balances=await xrocket.get_balances() if xrocket.is_configured() else []
         if isinstance(balances,dict): balances=[balances]
         vals=[]
         for x in balances:
-            if str(x.get("currency", x.get("asset", x.get("currencyCode","")))).upper()=="USDT": vals.append(str(x.get("balance", x.get("amount","0"))))
+            if str(x.get("currency", x.get("asset", x.get("currencyCode","")))).upper()=="USDT": vals.append(str(x.get("available", x.get("balance", x.get("amount","0")))))
         lines.append("🚀 <b>xRocket:</b> " + (", ".join(vals) + " USDT" if vals else "USDT: нет данных"))
     except Exception as e: lines.append(f"🚀 <b>xRocket:</b> ❌ {escape(str(e))}")
     return "\n".join(lines)
@@ -148,8 +148,17 @@ async def cash_amount(m: Message, state: FSMContext):
     if not amount: await m.answer("Введите корректную сумму."); return
     d=await state.get_data(); await state.update_data(cash_amount_value=amount)
     if d.get("cash_action")=="withdraw" and d.get("cash_provider")=="xrocket":
-        await state.set_state(AdminStates.cash_withdraw_address); await m.answer("Введите адрес внешнего кошелька для вывода xRocket:"); return
+        await state.set_state(AdminStates.cash_withdraw_network); await m.answer("Введите сеть для вывода xRocket USDT (TON, TRX, BSC, ETH, SOL):"); return
     await _cash_execute(m, state, None)
+
+@admin_router.message(AdminStates.cash_withdraw_network)
+async def cash_network(m: Message, state: FSMContext):
+    network=(m.text or "").strip().upper()
+    if network not in {"TON","TRX","BSC","ETH","SOL"}:
+        await m.answer("Доступные сети: TON, TRX, BSC, ETH, SOL."); return
+    await state.update_data(cash_withdraw_network=network)
+    await state.set_state(AdminStates.cash_withdraw_address)
+    await m.answer("Введите адрес внешнего кошелька:")
 
 @admin_router.message(AdminStates.cash_withdraw_address)
 async def cash_address(m: Message, state: FSMContext):
@@ -157,7 +166,7 @@ async def cash_address(m: Message, state: FSMContext):
 
 async def _cash_execute(m: Message, state: FSMContext, address):
     from . import cryptobot, xrocket
-    d=await state.get_data(); provider=d.get("cash_provider"); action=d.get("cash_action"); amount=float(d.get("cash_amount_value")); await state.clear()
+    d=await state.get_data(); provider=d.get("cash_provider"); action=d.get("cash_action"); amount=float(d.get("cash_amount_value")); network=d.get("cash_withdraw_network"); await state.clear()
     try:
         if action=="deposit":
             if provider=="cryptobot": inv=await cryptobot.create_invoice(amount, "Пополнение кассы TornadoPay", "admin-cash") ; link=inv.get("bot_invoice_url") or inv.get("mini_app_invoice_url")
@@ -166,13 +175,9 @@ async def _cash_execute(m: Message, state: FSMContext, address):
         if provider=="cryptobot":
             check=await cryptobot.create_check(amount, m.from_user.id); link=check.get("bot_check_url") or check.get("mini_app_check_url")
             await m.answer(f"💸 Чек CryptoBot на <b>{amount:.4f} USDT</b> создан.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎁 Получить чек", url=link)]]), parse_mode="HTML"); return
-        # Legacy xRocket withdrawal endpoint
-        if not xrocket.is_configured(): raise xrocket.XRocketError("XROCKET_API_KEY не задан")
-        async with __import__('aiohttp').ClientSession() as session:
-            async with session.post(f"{xrocket.XROCKET_BASE_URL}/app/withdrawal", json={"amount":amount,"currency":"USDT","address":address}, headers=xrocket._headers()) as r:
-                data=await r.json(content_type=None)
-                if r.status not in (200,201) or not data.get("success"): raise xrocket.XRocketError(data.get("message") or f"HTTP {r.status}")
-        await m.answer(f"💸 Вывод xRocket на <code>{escape(address)}</code> на сумму <b>{amount:.4f} USDT</b> отправлен.", parse_mode="HTML")
+        result=await xrocket.create_withdrawal(amount, address, network)
+        wid=result.get("withdrawalId", result.get("id", "")) if isinstance(result,dict) else ""
+        await m.answer(f"💸 Вывод xRocket на <code>{escape(address)}</code> ({network}) на сумму <b>{amount:.4f} USDT</b> создан." + (f"\nID: <code>{escape(str(wid))}</code>" if wid else ""), parse_mode="HTML")
     except Exception as e:
         await m.answer(f"❌ Операция не выполнена: <code>{escape(str(e))}</code>", parse_mode="HTML")
 

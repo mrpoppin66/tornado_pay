@@ -31,3 +31,12 @@
 Порядок для пользователя: принять пользовательское соглашение → подписаться на канал → бот открывает главное меню. Оба условия проверяются при каждом действии в боте (не только при `/start`), так что подписку нельзя обойти, просто закрыв сообщение с просьбой подписаться.
 
 Если бот не сможет проверить подписку (например, забыли добавить его администратором в канал), пользователей это не заблокирует — проверка в этом случае пропускается, а ошибка попадает в лог сервера, чтобы её можно было заметить и поправить конфигурацию.
+
+## xRocket Pay API (Current)
+Use the current Pay API token, not a Legacy `Rocket-Pay-Key`:
+```env
+XROCKET_API_TOKEN=your_current_pay_api_bearer_token
+XROCKET_WEBHOOK_SECRET=your_pay_api_webhook_secret
+XROCKET_BASE_URL=https://pay.api.xrocket.exchange
+```
+In @xRocket open your application → Settings → API Version → Current, then issue/copy the API Token. Do not use an Exchange API token here.
