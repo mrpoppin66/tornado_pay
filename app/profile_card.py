@@ -12,11 +12,31 @@ FONT_PATH = os.path.join(BASE_DIR, "assets", "fonts", "DejaVuSans-Bold.ttf")
 AVATAR_CENTER = (374, 418)
 AVATAR_RADIUS = 190
 
-ID_BOX = (1100, 295, 1590, 385)     # (left, top, right, bottom)
-ROLE_BOX = (1100, 465, 1590, 560)
+ID_BOX = (1100, 296, 1590, 394)     # (left, top, right, bottom)
+ROLE_BOX = (1100, 493, 1590, 590)
+
+# Прямоугольники декоративных прочерков-заглушек в шаблоне (их нужно стереть перед текстом).
+ID_DASH_RECT = (1075, 333, 1235, 363)
+ROLE_DASH_RECT = (1160, 522, 1310, 558)
 
 TEXT_COLOR = (210, 255, 245)
 SUPERSAMPLE = 4  # для сглаженного круга аватарки
+
+
+def _erase_rect(image: Image.Image, rect: tuple, margin: int = 4):
+    """Замазать прямоугольник (например, декоративный прочерк) цветом фона,
+    беря его слева и справа от прямоугольника и линейно интерполируя —
+    так заплатка остаётся незаметной на градиентной заливке плашки."""
+    x0, y0, x1, y1 = rect
+    left_color = image.getpixel((x0 - margin, (y0 + y1) // 2))[:3]
+    right_color = image.getpixel((x1 + margin, (y0 + y1) // 2))[:3]
+    px = image.load()
+    width = max(1, x1 - x0)
+    for x in range(x0, x1 + 1):
+        t = (x - x0) / width
+        color = tuple(int(left_color[i] + (right_color[i] - left_color[i]) * t) for i in range(3))
+        for y in range(y0, y1 + 1):
+            px[x, y] = (*color, 255)
 
 
 def _load_font(size: int) -> ImageFont.FreeTypeFont:
@@ -75,6 +95,8 @@ def _make_circular_avatar(avatar_bytes: bytes, diameter: int) -> Image.Image:
 def build_profile_card(display_id, role_label: str, avatar_bytes: bytes | None = None) -> bytes:
     """Собрать PNG-карточку профиля с ID, ролью и (опционально) аватаркой пользователя."""
     template = Image.open(TEMPLATE_PATH).convert("RGBA")
+    _erase_rect(template, ID_DASH_RECT)
+    _erase_rect(template, ROLE_DASH_RECT)
     draw = ImageDraw.Draw(template)
 
     if avatar_bytes:

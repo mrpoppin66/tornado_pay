@@ -266,7 +266,7 @@ async def init_db():
         CREATE TABLE IF NOT EXISTS deposits(
             id BIGSERIAL PRIMARY KEY,
             user_id BIGINT NOT NULL REFERENCES users(user_id),
-            invoice_id BIGINT NOT NULL UNIQUE,
+            invoice_id TEXT NOT NULL UNIQUE,
             amount NUMERIC(18,4) NOT NULL CHECK (amount > 0),
             status TEXT NOT NULL DEFAULT 'pending',
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
@@ -278,6 +278,11 @@ async def init_db():
         """)
 
         # Миграции для старых баз: добавляем колонки, которых может не хватать
+        # Multi-provider deposits: xRocket IDs are numeric, Crypto Pay IDs are also namespaced.
+        try:
+            await conn.execute("ALTER TABLE deposits ALTER COLUMN invoice_id TYPE TEXT USING invoice_id::text")
+        except Exception as e:
+            print(f"[db migration deposits.invoice_id] {e}")
         await _add_column_if_missing(conn, "users", "role", "TEXT NOT NULL DEFAULT 'client'")
         await _add_column_if_missing(conn, "users", "executor_name", "TEXT")
         await _add_column_if_missing(conn, "users", "executor_description", "TEXT")
@@ -1169,6 +1174,7 @@ async def adjust_balance(user_id, delta, admin_comment=None):
 # ---------- Депозиты (пополнение через xRocket) ----------
 
 async def create_deposit(user_id, invoice_id, amount):
+    invoice_id = str(invoice_id)
     async with pool.acquire() as conn:
         return await conn.fetchval(
             "INSERT INTO deposits(user_id, invoice_id, amount) VALUES($1,$2,$3) RETURNING id",
@@ -1176,6 +1182,7 @@ async def create_deposit(user_id, invoice_id, amount):
         )
 
 async def get_deposit_by_invoice(invoice_id):
+    invoice_id = str(invoice_id)
     async with pool.acquire() as conn:
         return await conn.fetchrow(
             "SELECT id, user_id, invoice_id, amount, status FROM deposits WHERE invoice_id=$1",
@@ -1183,6 +1190,7 @@ async def get_deposit_by_invoice(invoice_id):
         )
 
 async def mark_deposit_paid(invoice_id, paid_amount=None):
+    invoice_id = str(invoice_id)
     """Идемпотентно зачисляет депозит на баланс пользователя: если счёт с
     таким invoice_id уже обработан (или не найден) — ничего не делает и
     возвращает None. Так безопасно вызывать эту функцию и из вебхука
@@ -1200,11 +1208,12 @@ async def mark_deposit_paid(invoice_id, paid_amount=None):
             await conn.execute("UPDATE users SET balance = balance + $1 WHERE user_id=$2", credit, row["user_id"])
             await conn.execute(
                 "INSERT INTO transactions(user_id,amount,type,description) VALUES($1,$2,'deposit',$3)",
-                row["user_id"], credit, f"Пополнение через xRocket (счёт #{invoice_id})",
+                row["user_id"], credit, f"Пополнение (счёт #{invoice_id})",
             )
             return {"deposit_id": row["id"], "user_id": row["user_id"], "amount": credit}
 
 async def mark_deposit_expired(invoice_id):
+    invoice_id = str(invoice_id)
     async with pool.acquire() as conn:
         await conn.execute(
             "UPDATE deposits SET status='expired' WHERE invoice_id=$1 AND status='pending'",
