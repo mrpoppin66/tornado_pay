@@ -7,7 +7,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, TelegramObject, BotCommand
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, BufferedInputFile, TelegramObject, BotCommand
 from aiohttp import web
 from dotenv import load_dotenv
 from .db import (
@@ -32,6 +32,7 @@ from .db import (
 )
 from . import xrocket
 from .admin import admin_router, ADMIN_IDS
+from .profile_card import build_profile_card, get_avatar_bytes
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
@@ -491,12 +492,26 @@ async def profile(c: CallbackQuery):
     kb_rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     role_label = "Исполнитель" if u[3] == "executor" else "Пользователь"
-    await safe_edit(c,
+    caption = (
         f"👤 <b>Личный кабинет</b>\n\n"
-        f"ID: <code>{u[0]}</code>\n"
-        f"Роль: <b>{role_label}</b>\n"
-        f"Баланс: <b>{float(u[2]):.4f} USDT</b>",
-        reply_markup=kb, parse_mode="HTML")
+        f"Баланс: <b>{float(u[2]):.4f} USDT</b>"
+    )
+    try:
+        avatar_bytes = await get_avatar_bytes(c.bot, c.from_user.id)
+        card_bytes = build_profile_card(u[0], role_label, avatar_bytes)
+        photo = BufferedInputFile(card_bytes, filename="profile.png")
+        try:
+            await c.message.delete()
+        except Exception:
+            pass
+        await c.message.answer_photo(photo, caption=caption, reply_markup=kb, parse_mode="HTML")
+    except Exception as e:
+        print(f"[profile card] {e}")
+        await safe_edit(c,
+            f"{caption}\n\n"
+            f"ID: <code>{u[0]}</code>\n"
+            f"Роль: <b>{role_label}</b>",
+            reply_markup=kb, parse_mode="HTML")
     await c.answer()
 
 @dp.callback_query(F.data == "profile:transactions")
