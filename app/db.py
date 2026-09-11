@@ -777,6 +777,44 @@ async def get_withdrawal_by_provider_id(provider, provider_id):
         provider, str(provider_id)
     )
 
+
+async def mark_withdrawal_error(withdrawal_id, admin_comment=''):
+    await pool.execute(
+        "UPDATE withdrawal_requests SET status='error', admin_comment=$2 WHERE id=$1 AND status IN ('pending','error')",
+        withdrawal_id, admin_comment
+    )
+
+async def get_admin_withdrawals(limit=100):
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT w.id, w.user_id, u.username, w.amount, w.wallet, w.status, w.created_at,
+                      w.provider, w.provider_id, w.provider_link, w.provider_status, w.admin_comment, w.processed_at
+               FROM withdrawal_requests w JOIN users u ON u.user_id=w.user_id
+               WHERE w.status IN ('pending','error')
+               ORDER BY CASE WHEN w.status='error' THEN 0 ELSE 1 END, w.id ASC LIMIT $1""", limit)
+
+async def force_refund_withdrawal(withdrawal_id, admin_comment=''):
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row=await conn.fetchrow("SELECT user_id,amount,status FROM withdrawal_requests WHERE id=$1 FOR UPDATE", withdrawal_id)
+            if not row or row[2] not in ('pending','error'):
+                return None
+            amount=float(row[1])
+            await conn.execute("UPDATE users SET balance=balance+$1 WHERE user_id=$2", amount, row[0])
+            await conn.execute("UPDATE withdrawal_requests SET status='rejected', admin_comment=$1, processed_at=now() WHERE id=$2", admin_comment, withdrawal_id)
+            await conn.execute("INSERT INTO transactions(user_id,amount,type,description) VALUES($1,$2,'withdrawal_refund',$3)", row[0], amount, f"Возврат вывода #{withdrawal_id}")
+            return row[0], amount
+
+async def force_mark_withdrawal_paid(withdrawal_id, admin_comment=''):
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            row=await conn.fetchrow("SELECT user_id,amount,status FROM withdrawal_requests WHERE id=$1 FOR UPDATE", withdrawal_id)
+            if not row or row[2] not in ('pending','error'):
+                return None
+            await conn.execute("UPDATE withdrawal_requests SET status='paid', admin_comment=$1, processed_at=now() WHERE id=$2", admin_comment, withdrawal_id)
+            await conn.execute("INSERT INTO transactions(user_id,amount,type,description) VALUES($1,0,'withdrawal_paid',$3)", row[0], f"Вывод #{withdrawal_id} отмечен выплаченным администратором")
+            return row[0], float(row[1])
+
 async def approve_withdrawal(withdrawal_id, admin_comment=''):
     async with pool.acquire() as conn:
         async with conn.transaction():

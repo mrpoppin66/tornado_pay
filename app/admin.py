@@ -27,7 +27,7 @@ from .db import (
     list_executor_applications, get_executor_application, set_executor_application_question,
     approve_executor_application, reject_executor_application, block_executor, unblock_executor,
     EXECUTOR_APPLICATION_STATUSES,
-    settle_order_executor, refund_order_client, get_pending_withdrawals, approve_withdrawal, reject_withdrawal, get_withdrawal, get_disputed_orders, get_recent_chat_messages,
+    settle_order_executor, refund_order_client, get_pending_withdrawals, get_admin_withdrawals, approve_withdrawal, reject_withdrawal, force_refund_withdrawal, force_mark_withdrawal_paid, get_withdrawal, get_disputed_orders, get_recent_chat_messages,
     get_order_events, get_order_evidence, list_executors_admin, set_user_blocked_only, get_all_services_stats, set_service_max_amount, get_service_limits, get_user_blocked, get_user_block_info,
     log_order_event, create_notification, get_service,
 )
@@ -49,8 +49,8 @@ async def notify_new_withdrawal(withdrawal_id, bot: Bot):
         f"💸 <b>Новая заявка на вывод #{w[0]}</b>\n\n"
         f"Исполнитель: @{w[2] or '—'} (<code>{w[1]}</code>)\n"
         f"Сумма: <b>{float(w[3]):.4f} USDT</b>\n\n"
-        "Раздел «💸 Выводы» пока в разработке — обработать вывод можно вручную "
-        "через «👤 Пользователь» → корректировка баланса, отдельно списав сумму."
+        "Откройте «💸 Выводы» в админ-панели для просмотра, возврата средств "
+        "или повторной автоматической выплаты."
     )
     for admin_id in ADMIN_IDS:
         try:
@@ -1087,24 +1087,109 @@ async def admin_disputes(c: CallbackQuery, state: FSMContext):
 
 
 # ---------- Выводы ----------
-# Обработка (подтверждение/отклонение) выводов — отдельный следующий этап.
-# Пока только список, чтобы админ видел накопившиеся заявки.
+
+def _withdrawal_status_label(status):
+    return {"pending":"⏳ ожидает", "error":"❌ ошибка", "paid":"✅ выплачен", "rejected":"↩️ возвращён"}.get(str(status), str(status))
+
+def _withdrawal_list_kb(rows):
+    kb=[]
+    for w in rows:
+        username = f"@{w[2]}" if w[2] else str(w[1])
+        provider = "🤖" if w[7] == "cryptobot" else "🚀" if w[7] == "xrocket" else "💳"
+        kb.append([InlineKeyboardButton(text=f"#{w[0]} {provider} {float(w[3]):.4f} USDT — {_withdrawal_status_label(w[5])}", callback_data=f"adm:withdrawal:{w[0]}")])
+    kb.append([InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
 
 @admin_router.callback_query(F.data == "adm:withdrawals")
 async def admin_withdrawals(c: CallbackQuery, state: FSMContext):
-    await state.clear()
-    rows = await get_pending_withdrawals()
-    if not rows:
-        text = "💸 <b>Выводы</b>\n\nЗаявок на вывод нет."
-    else:
-        lines = [f"#{w[0]} — @{w[2] or w[1]} (<code>{w[1]}</code>) — {float(w[3]):.4f} USDT" for w in rows]
-        text = (
-            "💸 <b>Выводы: ожидают обработки</b>\n\n" + "\n".join(lines) +
-            "\n\n⚠️ Подтверждение/отклонение выводов ещё не реализовано в этом разделе — "
-            "используйте «👤 Пользователь», чтобы вручную скорректировать баланс после выплаты."
-        )
-    await c.message.edit_text(text, reply_markup=admin_back_kb(), parse_mode="HTML")
+    if state:
+        await state.clear()
+    rows = await get_admin_withdrawals()
+    text = "💸 <b>Выводы</b>\n\n" + ("Нет зависших или ошибочных выводов." if not rows else "Выберите вывод для обработки:")
+    await c.message.edit_text(text, reply_markup=_withdrawal_list_kb(rows), parse_mode="HTML")
     await c.answer()
+
+@admin_router.callback_query(F.data.startswith("adm:withdrawal:"))
+async def admin_withdrawal_detail(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    wid=int(c.data.rsplit(":",1)[1])
+    w=await get_withdrawal(wid)
+    if not w:
+        await c.answer("Вывод не найден.", show_alert=True); return
+    username=f"@{w[2]}" if w[2] else "—"
+    provider="CryptoBot" if w[6]=="cryptobot" else "xRocket" if w[6]=="xrocket" else (w[6] or "—")
+    lines=[
+        f"💸 <b>Вывод #{w[0]}</b>",
+        "",
+        f"Исполнитель: {username} (<code>{w[1]}</code>)",
+        f"Сумма: <b>{float(w[3]):.4f} USDT</b>",
+        f"Способ: <b>{provider}</b>",
+        f"Статус: <b>{_withdrawal_status_label(w[4])}</b>",
+        f"Статус провайдера: <code>{escape(str(w[9] or '—'))}</code>",
+        f"ID провайдера: <code>{escape(str(w[7] or '—'))}</code>",
+    ]
+    kb=[]
+    if w[4] in ('pending','error'):
+        kb.append([InlineKeyboardButton(text="↩️ Вернуть средства", callback_data=f"adm:withdrawal:refund:{wid}")])
+        kb.append([InlineKeyboardButton(text="✅ Отметить выплаченным", callback_data=f"adm:withdrawal:paid:{wid}")])
+    if w[4] in ('pending','error') and (not w[6] or not w[7] or str(w[9]).lower() in ('error','failed','expired')):
+        kb.append([InlineKeyboardButton(text="🔄 Повторить автоматическую выплату", callback_data=f"adm:withdrawal:retry:{wid}")])
+    if w[8]: kb.append([InlineKeyboardButton(text="🔗 Открыть чек", url=w[8])])
+    kb.append([InlineKeyboardButton(text="⬅️ К списку выводов", callback_data="adm:withdrawals")])
+    await c.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=kb), parse_mode="HTML")
+    await c.answer()
+
+@admin_router.callback_query(F.data.startswith("adm:withdrawal:refund:"))
+async def admin_withdrawal_refund(c: CallbackQuery):
+    wid=int(c.data.rsplit(":",1)[1])
+    result=await force_refund_withdrawal(wid, f"Возврат администратором {c.from_user.id}")
+    if not result: await c.answer("Вывод уже обработан.", show_alert=True); return
+    user_id,amount=result
+    try: await c.bot.send_message(user_id, f"↩️ Вывод #{wid} отменён администратором. <b>{amount:.4f} USDT</b> возвращены на баланс.", parse_mode="HTML")
+    except Exception: pass
+    await c.answer("Средства возвращены.", show_alert=True)
+    await admin_withdrawals(c, None)
+
+@admin_router.callback_query(F.data.startswith("adm:withdrawal:paid:"))
+async def admin_withdrawal_paid(c: CallbackQuery):
+    wid=int(c.data.rsplit(":",1)[1])
+    result=await force_mark_withdrawal_paid(wid, f"Ручная обработка администратором {c.from_user.id}")
+    if not result: await c.answer("Вывод уже обработан.", show_alert=True); return
+    user_id,amount=result
+    try: await c.bot.send_message(user_id, f"✅ Вывод #{wid} обработан администратором. Сумма: <b>{amount:.4f} USDT</b>.", parse_mode="HTML")
+    except Exception: pass
+    await c.answer("Вывод отмечен выплаченным.", show_alert=True)
+    await admin_withdrawals(c, None)
+
+@admin_router.callback_query(F.data.startswith("adm:withdrawal:retry:"))
+async def admin_withdrawal_retry(c: CallbackQuery):
+    wid=int(c.data.rsplit(":",1)[1])
+    w=await get_withdrawal(wid)
+    if not w or w[4] not in ('pending','error'):
+        await c.answer("Вывод уже обработан.", show_alert=True); return
+    try:
+        from . import cryptobot, xrocket
+        if w[6] == "cryptobot":
+            check=await cryptobot.create_check(float(w[3]))
+            link=check.get("bot_check_url") or check.get("mini_app_check_url")
+            if not link: raise RuntimeError("CryptoBot не вернул ссылку")
+            pid=str(check.get("id") or check.get("hash") or "")
+            await set_withdrawal_provider(wid,"cryptobot",pid,link,"active")
+            await approve_withdrawal(wid,"Повторная автоматическая выплата")
+        elif w[6] == "xrocket":
+            cheque=await xrocket.create_cheque(float(w[3]), int(w[1]), description=f"TornadoPay withdrawal #{wid}", client_cheque_id=f"tp-wd-{wid}-retry")
+            link=cheque.get("link")
+            if not link: raise RuntimeError("xRocket не вернул ссылку")
+            pid=str(cheque.get("chequeId") or cheque.get("id") or "")
+            await set_withdrawal_provider(wid,"xrocket",pid,link,cheque.get("state","active"))
+            await approve_withdrawal(wid,"Повторная автоматическая выплата")
+        else: raise RuntimeError("Неизвестный способ выплаты")
+        await c.bot.send_message(w[1], f"✅ Вывод #{wid} успешно обработан повторно.\n\nСумма: <b>{float(w[3]):.4f} USDT</b>\nСсылка на чек: {link}", parse_mode="HTML")
+        await c.answer("Выплата создана повторно.", show_alert=True)
+    except Exception as e:
+        await mark_withdrawal_error(wid, str(e)[:500])
+        await c.answer(f"Ошибка: {str(e)[:150]}", show_alert=True)
+    await admin_withdrawals(c, None)
 
 
 # ---------- Статистика ----------
