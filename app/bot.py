@@ -490,8 +490,6 @@ async def profile(c: CallbackQuery):
         [InlineKeyboardButton(text="📊 История операций", callback_data="profile:transactions")],
         [InlineKeyboardButton(text="💳 Пополнить", callback_data="profile:deposit")],
     ]
-    if u[3] == "executor":
-        kb_rows.append([InlineKeyboardButton(text="💸 Вывести", callback_data="exec:withdraw")])
     kb_rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     role_label = "Исполнитель" if u[3] == "executor" else "Пользователь"

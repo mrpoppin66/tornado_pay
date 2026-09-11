@@ -84,3 +84,13 @@ def verify_webhook_signature(raw_body: bytes, signature: str) -> bool:
     secret = hashlib.sha256(XROCKET_API_KEY.encode()).digest()
     expected = hmac.new(secret, raw_body, hashlib.sha256).hexdigest()
     return hmac.compare_digest(expected, signature)
+
+async def get_app_info():
+    """Legacy xRocket Pay: информация о приложении, включая balances."""
+    if not is_configured(): raise XRocketError("XROCKET_API_KEY не задан")
+    async with aiohttp.ClientSession() as session:
+        async with session.get(f"{XROCKET_BASE_URL}/app/info", headers=_headers(), timeout=aiohttp.ClientTimeout(total=15)) as resp:
+            data=await resp.json(content_type=None)
+            if resp.status not in (200,201) or not data.get("success"):
+                raise XRocketError(data.get("message") or f"HTTP {resp.status}")
+            return data.get("data", data)

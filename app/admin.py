@@ -77,6 +77,8 @@ class AdminStates(StatesGroup):
     waiting_executor_rejection = State()
     waiting_block_reason = State()
     waiting_emoji_probe = State()
+    cash_amount = State()
+    cash_withdraw_address = State()
 
 
 def parse_positive_number(text):
@@ -89,6 +91,90 @@ def parse_positive_number(text):
         return None
     return value if value > 0 else None
 
+
+
+def cash_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🔄 Обновить балансы", callback_data="cash:balances")],
+        [InlineKeyboardButton(text="➕ Пополнить CryptoBot", callback_data="cash:deposit:cryptobot")],
+        [InlineKeyboardButton(text="➕ Пополнить xRocket", callback_data="cash:deposit:xrocket")],
+        [InlineKeyboardButton(text="💸 Вывести CryptoBot (чек)", callback_data="cash:withdraw:cryptobot")],
+        [InlineKeyboardButton(text="💸 Вывести xRocket", callback_data="cash:withdraw:xrocket")],
+    ])
+
+async def _cash_balances_text():
+    from . import cryptobot, xrocket
+    lines=["💼 <b>Касса платёжных систем</b>", ""]
+    try:
+        cb=await cryptobot.get_balances() if cryptobot.is_configured() else []
+        vals=[]
+        for x in cb:
+            if str(x.get("currency_code", x.get("asset",""))).upper()=="USDT": vals.append(str(x.get("available", x.get("balance", x.get("available_balance","0")))))
+        lines.append("🤖 <b>CryptoBot:</b> " + (", ".join(vals) + " USDT" if vals else "USDT: 0 / нет данных"))
+    except Exception as e: lines.append(f"🤖 <b>CryptoBot:</b> ❌ {escape(str(e))}")
+    try:
+        info=await xrocket.get_app_info() if xrocket.is_configured() else {}
+        balances=info.get("balances", []) if isinstance(info,dict) else []
+        if isinstance(balances,dict): balances=[balances]
+        vals=[]
+        for x in balances:
+            if str(x.get("currency", x.get("asset", x.get("currencyCode","")))).upper()=="USDT": vals.append(str(x.get("balance", x.get("amount","0"))))
+        lines.append("🚀 <b>xRocket:</b> " + (", ".join(vals) + " USDT" if vals else "USDT: нет данных"))
+    except Exception as e: lines.append(f"🚀 <b>xRocket:</b> ❌ {escape(str(e))}")
+    return "\n".join(lines)
+
+@admin_router.message(Command("cash"))
+async def cash_entry(m: Message, state: FSMContext):
+    await state.clear()
+    await m.answer(await _cash_balances_text(), reply_markup=cash_menu_kb(), parse_mode="HTML")
+
+@admin_router.callback_query(F.data == "cash:balances")
+async def cash_balances(c: CallbackQuery, state: FSMContext):
+    await state.clear(); await c.message.edit_text(await _cash_balances_text(), reply_markup=cash_menu_kb(), parse_mode="HTML"); await c.answer()
+
+@admin_router.callback_query(F.data.startswith("cash:deposit:"))
+async def cash_deposit(c: CallbackQuery, state: FSMContext):
+    provider=c.data.rsplit(":",1)[1]; await state.update_data(cash_action="deposit", cash_provider=provider); await state.set_state(AdminStates.cash_amount)
+    await c.message.edit_text(f"➕ <b>Пополнение {provider}</b>\n\nВведите сумму в USDT:", parse_mode="HTML"); await c.answer()
+
+@admin_router.callback_query(F.data.startswith("cash:withdraw:"))
+async def cash_withdraw(c: CallbackQuery, state: FSMContext):
+    provider=c.data.rsplit(":",1)[1]; await state.update_data(cash_action="withdraw", cash_provider=provider); await state.set_state(AdminStates.cash_amount)
+    await c.message.edit_text(f"💸 <b>Вывод из {provider}</b>\n\nВведите сумму в USDT:", parse_mode="HTML"); await c.answer()
+
+@admin_router.message(AdminStates.cash_amount)
+async def cash_amount(m: Message, state: FSMContext):
+    amount=parse_positive_number(m.text)
+    if not amount: await m.answer("Введите корректную сумму."); return
+    d=await state.get_data(); await state.update_data(cash_amount_value=amount)
+    if d.get("cash_action")=="withdraw" and d.get("cash_provider")=="xrocket":
+        await state.set_state(AdminStates.cash_withdraw_address); await m.answer("Введите адрес внешнего кошелька для вывода xRocket:"); return
+    await _cash_execute(m, state, None)
+
+@admin_router.message(AdminStates.cash_withdraw_address)
+async def cash_address(m: Message, state: FSMContext):
+    await _cash_execute(m, state, (m.text or "").strip())
+
+async def _cash_execute(m: Message, state: FSMContext, address):
+    from . import cryptobot, xrocket
+    d=await state.get_data(); provider=d.get("cash_provider"); action=d.get("cash_action"); amount=float(d.get("cash_amount_value")); await state.clear()
+    try:
+        if action=="deposit":
+            if provider=="cryptobot": inv=await cryptobot.create_invoice(amount, "Пополнение кассы TornadoPay", "admin-cash") ; link=inv.get("bot_invoice_url") or inv.get("mini_app_invoice_url")
+            else: inv=await xrocket.create_invoice(amount, "Пополнение кассы TornadoPay", "admin-cash") ; link=inv.get("link") or inv.get("url")
+            await m.answer(f"➕ Счёт на <b>{amount:.4f} USDT</b> создан.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💳 Оплатить", url=link)],[InlineKeyboardButton(text="🔄 Касса", callback_data="cash:balances")]]), parse_mode="HTML"); return
+        if provider=="cryptobot":
+            check=await cryptobot.create_check(amount, m.from_user.id); link=check.get("bot_check_url") or check.get("mini_app_check_url")
+            await m.answer(f"💸 Чек CryptoBot на <b>{amount:.4f} USDT</b> создан.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎁 Получить чек", url=link)]]), parse_mode="HTML"); return
+        # Legacy xRocket withdrawal endpoint
+        if not xrocket.is_configured(): raise xrocket.XRocketError("XROCKET_API_KEY не задан")
+        async with __import__('aiohttp').ClientSession() as session:
+            async with session.post(f"{xrocket.XROCKET_BASE_URL}/app/withdrawal", json={"amount":amount,"currency":"USDT","address":address}, headers=xrocket._headers()) as r:
+                data=await r.json(content_type=None)
+                if r.status not in (200,201) or not data.get("success"): raise xrocket.XRocketError(data.get("message") or f"HTTP {r.status}")
+        await m.answer(f"💸 Вывод xRocket на <code>{escape(address)}</code> на сумму <b>{amount:.4f} USDT</b> отправлен.", parse_mode="HTML")
+    except Exception as e:
+        await m.answer(f"❌ Операция не выполнена: <code>{escape(str(e))}</code>", parse_mode="HTML")
 
 def admin_menu_kb():
     return InlineKeyboardMarkup(inline_keyboard=[

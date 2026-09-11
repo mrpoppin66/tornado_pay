@@ -35,3 +35,7 @@ async def create_check(amount, user_id=None):
     body={"asset": CHECK_ASSET, "amount": f"{float(amount):.4f}"}
     if user_id: body["pin_to_user_id"] = int(user_id)
     return await _request("POST", "createCheck", json=body)
+
+async def get_balances():
+    """Возвращает балансы приложения Crypto Pay по активам."""
+    return await _request("GET", "getBalance")
