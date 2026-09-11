@@ -132,6 +132,43 @@ async def get_cheque(cheque_id=None, client_cheque_id=None):
         data["link"] = links.get("telegramMiniAppLink") or data.get("url") or data.get("link") or ""
     return data
 
+async def create_payout(amount, telegram_user_id, description="", client_payout_id=None):
+    """Send an immediate xRocket Pay payout directly to a Telegram user.
+
+    Unlike a personal cheque, a payout is settled inside the POST request and
+    does not require the recipient to open/claim anything. The Pay API accepts
+    telegram_user_id as the target type and resolves it to the recipient's
+    internal xRocket user ID.
+    """
+    cid = client_payout_id or f"tp-wd-{uuid.uuid4().hex}"
+    body = {
+        "asset": "USDT",
+        "amount": f"{float(amount):.4f}",
+        "targetType": "telegram_user_id",
+        "target": str(telegram_user_id),
+        "clientPayoutId": cid,
+        "description": (description or "TornadoPay withdrawal")[:1000],
+    }
+    data = await _request("POST", "/api/v1/payouts", json=body)
+    if not isinstance(data, dict):
+        raise XRocketError("xRocket вернул некорректный ответ на payout")
+    data["id"] = data.get("payoutId", data.get("id"))
+    data["clientPayoutId"] = data.get("clientPayoutId", cid)
+    return data
+
+async def get_payout(payout_id=None, client_payout_id=None):
+    params = {}
+    if payout_id:
+        params["payoutId"] = str(payout_id)
+    if client_payout_id:
+        params["clientPayoutId"] = str(client_payout_id)
+    if not params:
+        raise XRocketError("Не указан payoutId или clientPayoutId")
+    data = await _request("GET", "/api/v1/payout", params=params)
+    if isinstance(data, dict):
+        data["id"] = data.get("payoutId", data.get("id"))
+    return data
+
 async def create_withdrawal(amount, address, network):
     body={"amount":f"{float(amount):.4f}", "asset":"USDT", "network":network,
           "address":address, "clientWithdrawalId":f"tp-cash-{uuid.uuid4().hex}"}

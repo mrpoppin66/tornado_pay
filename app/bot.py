@@ -1627,9 +1627,8 @@ async def executor_withdraw_amount(m: Message, state: FSMContext):
     await state.clear()
     if result!="ok": await m.answer("⏳ У вас уже есть заявка на вывод или недостаточно средств.", reply_markup=back()); return
 
-    # Both withdrawal methods are automatic personal cheques. The amount is
-    # first reserved in our DB and then reserved by the provider. If provider
-    # creation fails, reject_withdrawal() returns the amount to the executor.
+    # CryptoBot remains a public cheque. xRocket is a direct in-platform
+    # payout (transfer) to the executor's Telegram user on xRocket.
     try:
         if provider=="cryptobot":
             check=await cryptobot.create_check(amount)
@@ -1650,24 +1649,33 @@ async def executor_withdraw_amount(m: Message, state: FSMContext):
                 ]), parse_mode="HTML")
             return
 
-        cheque=await xrocket.create_cheque(
+        payout=await xrocket.create_payout(
             amount, m.from_user.id,
             description=f"TornadoPay withdrawal #{wid}",
-            client_cheque_id=f"tp-wd-{wid}"
+            client_payout_id=f"tp-wd-{wid}"
         )
-        link=cheque.get("link")
-        if not link:
-            raise RuntimeError("xRocket не вернул ссылку на чек")
-        provider_id=str(cheque.get("chequeId") or cheque.get("id") or "")
-        await set_withdrawal_provider(wid, "xrocket", provider_id, link, cheque.get("state", "active"))
-        await approve_withdrawal(wid, "xRocket cheque created")
+        provider_id=str(payout.get("payoutId") or payout.get("id") or "")
+        provider_state=str(payout.get("status") or "finished")
+        if not provider_id:
+            raise RuntimeError("xRocket не вернул ID перевода")
+
+        # Current Pay API payouts to xRocket users are settled atomically in
+        # the create request. A successful response normally has status
+        # "finished". Do not mark the local withdrawal paid unless xRocket
+        # explicitly confirms a successful payout.
+        if provider_state != "finished":
+            raise RuntimeError(f"xRocket создал перевод {provider_id}, но его статус: {provider_state}")
+
+        await set_withdrawal_provider(wid, "xrocket", provider_id, None, provider_state)
+        result=await approve_withdrawal(wid, "xRocket payout created")
+        if not result:
+            raise RuntimeError(f"Заявка #{wid} уже обработана или не найдена")
         await m.answer(
-            f"✅ <b>Вывод #{wid} создан автоматически.</b>\n\n"
+            f"✅ <b>Вывод #{wid} выполнен автоматически.</b>\n\n"
             f"Сумма: <b>{amount:.4f} USDT</b>\n"
-            f"Способ: <b>xRocket чек</b>\n\n"
-            "Чек уже готов и привязан к вашему Telegram-аккаунту.",
+            f"Способ: <b>xRocket перевод</b>\n\n"
+            "Средства отправлены напрямую на ваш xRocket-аккаунт.",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🚀 Открыть чек xRocket", url=link)],
                 [InlineKeyboardButton(text="⬅️ ЛК Исполнителя", callback_data="executor")]
             ]), parse_mode="HTML")
     except Exception as e:

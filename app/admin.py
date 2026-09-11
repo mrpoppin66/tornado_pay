@@ -1177,14 +1177,20 @@ async def admin_withdrawal_retry(c: CallbackQuery):
             await set_withdrawal_provider(wid,"cryptobot",pid,link,"active")
             await approve_withdrawal(wid,"Повторная автоматическая выплата")
         elif w[6] == "xrocket":
-            cheque=await xrocket.create_cheque(float(w[3]), int(w[1]), description=f"TornadoPay withdrawal #{wid}", client_cheque_id=f"tp-wd-{wid}-retry")
-            link=cheque.get("link")
-            if not link: raise RuntimeError("xRocket не вернул ссылку")
-            pid=str(cheque.get("chequeId") or cheque.get("id") or "")
-            await set_withdrawal_provider(wid,"xrocket",pid,link,cheque.get("state","active"))
-            await approve_withdrawal(wid,"Повторная автоматическая выплата")
+            payout=await xrocket.create_payout(
+                float(w[3]), int(w[1]),
+                description=f"TornadoPay withdrawal #{wid}",
+                client_payout_id=f"tp-wd-{wid}"
+            )
+            pid=str(payout.get("payoutId") or payout.get("id") or "")
+            status=str(payout.get("status") or "finished")
+            if not pid: raise RuntimeError("xRocket не вернул ID перевода")
+            if status != "finished": raise RuntimeError(f"xRocket вернул статус перевода: {status}")
+            await set_withdrawal_provider(wid,"xrocket",pid,None,status)
+            await approve_withdrawal(wid,"Повторная автоматическая выплата xRocket")
         else: raise RuntimeError("Неизвестный способ выплаты")
-        await c.bot.send_message(w[1], f"✅ Вывод #{wid} успешно обработан повторно.\n\nСумма: <b>{float(w[3]):.4f} USDT</b>\nСсылка на чек: {link}", parse_mode="HTML")
+        extra = f"\nСсылка на чек: {link}" if link else "\nСредства отправлены напрямую через xRocket."
+        await c.bot.send_message(w[1], f"✅ Вывод #{wid} успешно обработан повторно.\n\nСумма: <b>{float(w[3]):.4f} USDT</b>{extra}", parse_mode="HTML")
         await c.answer("Выплата создана повторно.", show_alert=True)
     except Exception as e:
         await mark_withdrawal_error(wid, str(e)[:500])

@@ -816,16 +816,33 @@ async def force_mark_withdrawal_paid(withdrawal_id, admin_comment=''):
             return row[0], float(row[1])
 
 async def approve_withdrawal(withdrawal_id, admin_comment=''):
+    # A provider cheque is already funded/reserved externally. Finalizing the
+    # local withdrawal must therefore not be allowed to roll back or turn the
+    # successful provider operation into an error because of a non-critical
+    # transaction-history insert.
     async with pool.acquire() as conn:
-        async with conn.transaction():
-            row=await conn.fetchrow("SELECT user_id,amount,status,wallet FROM withdrawal_requests WHERE id=$1 FOR UPDATE", withdrawal_id)
-            if not row or row[2] not in ('pending', 'error'):
-                return None
-            await conn.execute("UPDATE withdrawal_requests SET status='paid', admin_comment=$1, processed_at=now() WHERE id=$2", admin_comment, withdrawal_id)
+        row=await conn.fetchrow(
+            "SELECT user_id,amount,status,wallet FROM withdrawal_requests WHERE id=$1 FOR UPDATE",
+            withdrawal_id
+        )
+        if not row or row[2] not in ('pending', 'error'):
+            return None
+
+        await conn.execute(
+            "UPDATE withdrawal_requests SET status='paid', admin_comment=$1, processed_at=now() WHERE id=$2",
+            admin_comment, withdrawal_id
+        )
+
+        # History entry is useful, but it must never make a successfully
+        # created provider cheque look like a failed payout.
+        try:
             await conn.execute(
                 "INSERT INTO transactions(user_id,amount,type,description) VALUES($1,$2,'withdrawal_paid',$3)",
                 row[0], 0, f"Вывод #{withdrawal_id} выплачен")
-            return row[0], float(row[1]), row[3]
+        except Exception as e:
+            print(f"[withdrawal history] failed for #{withdrawal_id}: {e}")
+
+        return row[0], float(row[1]), row[3]
 
 async def reject_withdrawal(withdrawal_id, admin_comment=''):
     async with pool.acquire() as conn:
