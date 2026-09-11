@@ -292,6 +292,10 @@ async def init_db():
         # Старые версии использовали wallet для ручного вывода. Адреса больше не собираем:
         # оставляем колонку только для обратной совместимости, но делаем её необязательной.
         await conn.execute("ALTER TABLE withdrawal_requests ALTER COLUMN wallet DROP NOT NULL")
+        await _add_column_if_missing(conn, "withdrawal_requests", "provider", "TEXT")
+        await _add_column_if_missing(conn, "withdrawal_requests", "provider_id", "TEXT")
+        await _add_column_if_missing(conn, "withdrawal_requests", "provider_link", "TEXT")
+        await _add_column_if_missing(conn, "withdrawal_requests", "provider_status", "TEXT")
         await _add_column_if_missing(conn, "users", "executor_blocked", "BOOLEAN NOT NULL DEFAULT FALSE")
         await _add_column_if_missing(conn, "users", "blocked", "BOOLEAN NOT NULL DEFAULT FALSE")
         await _add_column_if_missing(conn, "users", "block_reason", "TEXT")
@@ -715,7 +719,8 @@ async def get_executor_history(executor_id, limit=30):
 async def get_withdrawal(withdrawal_id):
     async with pool.acquire() as conn:
         return await conn.fetchrow(
-            """SELECT w.id, w.user_id, u.username, w.amount, w.status, w.created_at
+            """SELECT w.id, w.user_id, u.username, w.amount, w.status, w.created_at,
+                      w.provider, w.provider_id, w.provider_link, w.provider_status
                FROM withdrawal_requests w JOIN users u ON u.user_id=w.user_id
                WHERE w.id=$1""", withdrawal_id
         )
@@ -723,7 +728,8 @@ async def get_withdrawal(withdrawal_id):
 async def get_pending_withdrawals(limit=30):
     async with pool.acquire() as conn:
         return await conn.fetch(
-            """SELECT w.id, w.user_id, u.username, w.amount, w.wallet, w.status, w.created_at
+            """SELECT w.id, w.user_id, u.username, w.amount, w.wallet, w.status, w.created_at,
+                      w.provider, w.provider_id, w.provider_link, w.provider_status
                FROM withdrawal_requests w JOIN users u ON u.user_id=w.user_id
                WHERE w.status='pending' ORDER BY w.id ASC LIMIT $1""", limit
         )
@@ -750,6 +756,26 @@ async def create_withdrawal_request(user_id, amount):
                 "INSERT INTO transactions(user_id,amount,type,description) VALUES($1,$2,'withdrawal_hold',$3)",
                 user_id, -amount, f"Резерв на вывод #{wid}")
             return wid, 'ok'
+
+async def set_withdrawal_provider(withdrawal_id, provider, provider_id=None, provider_link=None, provider_status=None):
+    await pool.execute(
+        """UPDATE withdrawal_requests
+           SET provider=$2, provider_id=$3, provider_link=$4, provider_status=$5
+         WHERE id=$1""",
+        withdrawal_id, provider, provider_id, provider_link, provider_status
+    )
+
+async def set_withdrawal_provider_status(withdrawal_id, provider_status):
+    await pool.execute("UPDATE withdrawal_requests SET provider_status=$2 WHERE id=$1", withdrawal_id, provider_status)
+
+async def get_withdrawal_by_provider_id(provider, provider_id):
+    return await pool.fetchrow(
+        """SELECT id,user_id,amount,status,provider,provider_id,provider_link,provider_status
+             FROM withdrawal_requests
+            WHERE provider=$1 AND provider_id=$2
+            ORDER BY id DESC LIMIT 1""",
+        provider, str(provider_id)
+    )
 
 async def approve_withdrawal(withdrawal_id, admin_comment=''):
     async with pool.acquire() as conn:

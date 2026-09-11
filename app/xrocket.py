@@ -21,32 +21,94 @@ async def _request(method, path, *, json=None, params=None):
             try: data=await r.json(content_type=None)
             except Exception: data={"detail": await r.text()}
             if not 200 <= r.status < 300:
-                msg = data.get("detail") or data.get("message") or data.get("title") or f"HTTP {r.status}"
+                msg = (
+                    data.get("detail")
+                    or data.get("message")
+                    or data.get("title")
+                    or data.get("type")
+                    or f"HTTP {r.status}"
+                )
+                kind = data.get("kind")
+                if kind and str(kind) not in str(msg):
+                    msg = f"{msg} [{kind}]"
                 raise XRocketError(str(msg))
             return data
 
 def _normalize_invoice(x):
-    if not isinstance(x, dict): return x
-    links=x.get("links") or {}
-    return {**x, "id": x.get("invoiceId", x.get("id")), "link": links.get("telegramBotLink") or x.get("link") or x.get("url")}
+    if not isinstance(x, dict):
+        return x
+    links = x.get("links") or {}
+    # Current Pay API returns the invoice object directly.
+    # Keep a small compatibility layer for deployments that may still return
+    # invoiceId/link-style fields.
+    return {
+        **x,
+        "id": x.get("id", x.get("invoiceId")),
+        "link": (
+            links.get("telegramBotLink")
+            or x.get("link")
+            or x.get("url")
+            or ""
+        ),
+    }
 
 async def create_invoice(amount, description="", payload=""):
-    body={"amount": f"{float(amount):.4f}", "asset": DEPOSIT_CURRENCY,
-          "description": description[:1000], "clientInvoiceId": f"tp-{uuid.uuid4().hex}"}
-    # Current API uses callback.payload for correlation. Expires field is intentionally omitted
-    # until the API's application defaults are used.
-    if payload: body["callback"]={"payload": payload}
-    data=await _request("POST", "/api/v1/invoices", json=body)
+    # Current xRocket Pay API uses priceAmount/priceCurrency.
+    # The old Legacy names amount/asset cause:
+    # "The provided data failed validation".
+    body = {
+        "priceAmount": f"{float(amount):.4f}",
+        "priceCurrency": DEPOSIT_CURRENCY,
+        "description": description[:1000],
+        "clientInvoiceId": f"tp-{uuid.uuid4().hex}",
+        "expiresIn": DEPOSIT_EXPIRE_SECONDS,
+    }
+    if payload:
+        body["callback"] = {"payload": {"userId": str(payload)}}
+    data = await _request("POST", "/api/v1/invoices", json=body)
     return _normalize_invoice(data)
 
 async def get_invoice(invoice_id):
-    return _normalize_invoice(await _request("GET", "/api/v1/invoice", params={"invoiceId": str(invoice_id)}))
+    # Current invoice IDs are strings; do not cast them to int.
+    return _normalize_invoice(
+        await _request("GET", "/api/v1/invoice", params={"invoiceId": str(invoice_id)})
+    )
+
+async def get_invoice_payments(invoice_id):
+    data = await _request(
+        "GET", "/api/v1/invoice/payments",
+        params={"invoiceId": str(invoice_id)}
+    )
+    return data.get("items", data.get("payments", data if isinstance(data, list) else []))
 
 async def get_balances():
     data=await _request("GET", "/api/v1/balances")
     return data.get("items", data.get("balances", data if isinstance(data,list) else []))
 
 async def get_app_info(): return await _request("GET", "/api/v1/app-info")
+
+async def create_cheque(amount, telegram_user_id, description="", client_cheque_id=None):
+    """Create a personal xRocket cheque for a Telegram user.
+
+    The current Pay API reserves the amount from the application balance and
+    returns an activation link. The cheque is addressed to the Telegram user,
+    so the executor does not need to provide a blockchain address.
+    """
+    cid = client_cheque_id or f"tp-wd-{uuid.uuid4().hex}"
+    body = {
+        "asset": "USDT",
+        "amount": f"{float(amount):.4f}",
+        "targetType": "telegram_user_id",
+        "target": str(telegram_user_id),
+        "clientChequeId": cid,
+        "description": (description or "TornadoPay withdrawal")[:1000],
+    }
+    data = await _request("POST", "/api/v1/cheques", json=body)
+    links = data.get("links") or {}
+    data["id"] = data.get("chequeId", data.get("id"))
+    data["link"] = links.get("telegramMiniAppLink") or data.get("url") or ""
+    data["clientChequeId"] = data.get("clientChequeId", cid)
+    return data
 
 async def create_withdrawal(amount, address, network):
     body={"amount":f"{float(amount):.4f}", "asset":"USDT", "network":network,

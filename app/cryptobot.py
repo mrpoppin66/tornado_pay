@@ -32,8 +32,9 @@ async def get_invoice(invoice_id):
     return items[0]
 
 async def create_check(amount, user_id=None):
+    # Public CryptoBot cheque: do not pin it to a Telegram user.
+    # The optional user_id is kept only for backward-compatible callers.
     body={"asset": CHECK_ASSET, "amount": f"{float(amount):.4f}"}
-    if user_id: body["pin_to_user_id"] = int(user_id)
     return await _request("POST", "createCheck", json=body)
 
 async def get_balances():

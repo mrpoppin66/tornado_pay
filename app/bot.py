@@ -21,7 +21,7 @@ from .db import (
     confirm_order_by_client, dispute_order_by_client,
     get_order_chat_peer, save_order_chat_message, get_executor_active_order, get_executor_history,
     set_executor_card_details, get_executor_card_details, set_executor_card_reference, get_executor_card_reference,
-    create_withdrawal_request, get_user_transactions, get_chat_unread_count, get_chat_unread_for_orders,
+    create_withdrawal_request, set_withdrawal_provider, set_withdrawal_provider_status, get_withdrawal_by_provider_id, get_user_transactions, get_chat_unread_count, get_chat_unread_for_orders,
     mark_chat_read, get_recent_chat_messages, get_executor_detailed_stats,
     add_order_evidence, log_order_event, create_notification, get_notifications, get_notifications_count,
     get_unread_notifications_count, mark_notifications_read,
@@ -572,14 +572,26 @@ async def profile_deposit_amount(m: Message, state: FSMContext):
 async def profile_deposit_check(c: CallbackQuery):
     _,_,provider,invoice_id=c.data.split(":",3); key=f"{provider}:{invoice_id}"
     try:
-        invoice=await (cryptobot.get_invoice(invoice_id) if provider=="cryptobot" else xrocket.get_invoice(int(invoice_id)))
+        invoice=await (cryptobot.get_invoice(invoice_id) if provider=="cryptobot" else xrocket.get_invoice(invoice_id))
     except Exception as e: print(f"[deposit check] {e}"); await c.answer("Не удалось проверить оплату.", show_alert=True); return
     status=invoice.get("status")
     paid=status in ("paid","active_paid")
     if paid:
-        amount=invoice.get("paid_amount") or invoice.get("amount")
+        amount=invoice.get("paid_amount") or invoice.get("amount") or invoice.get("priceAmount")
         if provider=="xrocket":
-            ps=invoice.get("payments") or []; amount=ps[-1].get("paymentAmountReceived") if ps else amount
+            # Current Pay API keeps payments in a separate endpoint.
+            try:
+                payments = await xrocket.get_invoice_payments(invoice_id)
+            except Exception as e:
+                print(f"[xrocket payments] {e}")
+                payments = []
+            if payments:
+                p = payments[-1]
+                amount = (
+                    p.get("receiveAmount")
+                    or p.get("payAmount")
+                    or amount
+                )
         result=await mark_deposit_paid(key, amount)
         if result:
             u=await get_user(c.from_user.id); await safe_edit(c, f"✅ Баланс пополнен на <b>{result['amount']:.4f} USDT</b>.\n\nТекущий баланс: <b>{float(u[2]):.4f} USDT</b>", reply_markup=back(), parse_mode="HTML")
@@ -1614,15 +1626,56 @@ async def executor_withdraw_amount(m: Message, state: FSMContext):
     wid,result=await create_withdrawal_request(m.from_user.id, amount)
     await state.clear()
     if result!="ok": await m.answer("⏳ У вас уже есть заявка на вывод или недостаточно средств.", reply_markup=back()); return
-    if provider=="cryptobot":
-        try:
-            check=await cryptobot.create_check(amount, m.from_user.id)
-            await approve_withdrawal(wid, "CryptoBot check")
+
+    # Both withdrawal methods are automatic personal cheques. The amount is
+    # first reserved in our DB and then reserved by the provider. If provider
+    # creation fails, reject_withdrawal() returns the amount to the executor.
+    try:
+        if provider=="cryptobot":
+            check=await cryptobot.create_check(amount)
             link=check.get("bot_check_url") or check.get("mini_app_check_url")
-            await m.answer(f"✅ <b>Вывод #{wid} создан.</b>\n\nСумма: <b>{amount:.4f} USDT</b>\nСпособ: <b>CryptoBot чек</b>\n\nОткройте чек и активируйте его:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="🎁 Получить чек", url=link)],[InlineKeyboardButton(text="⬅️ ЛК Исполнителя", callback_data="executor")]]), parse_mode="HTML"); return
-        except Exception as e: print(f"[cryptobot check] {e}"); await reject_withdrawal(wid, "CryptoBot error"); await m.answer("❌ Не удалось создать чек CryptoBot. Средства возвращены на баланс.", reply_markup=back()); return
-    await m.answer(f"💸 <b>Заявка на вывод #{wid} создана.</b>\n\nСумма: <b>{amount:.4f} USDT</b>\nСпособ: <b>xRocket</b>\nСтатус: <b>На обработке</b>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ ЛК Исполнителя", callback_data="executor")]]), parse_mode="HTML")
-    from .admin import notify_new_withdrawal; await notify_new_withdrawal(wid, m.bot)
+            if not link:
+                raise RuntimeError("CryptoBot не вернул ссылку на чек")
+            provider_id=str(check.get("id") or check.get("hash") or "")
+            await set_withdrawal_provider(wid, "cryptobot", provider_id, link, "active")
+            await approve_withdrawal(wid, "CryptoBot check created")
+            await m.answer(
+                f"✅ <b>Вывод #{wid} создан автоматически.</b>\n\n"
+                f"Сумма: <b>{amount:.4f} USDT</b>\n"
+                f"Способ: <b>CryptoBot чек</b>\n\n"
+                "Чек уже готов и привязан к вашему Telegram-аккаунту.",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                    [InlineKeyboardButton(text="🎁 Открыть чек", url=link)],
+                    [InlineKeyboardButton(text="⬅️ ЛК Исполнителя", callback_data="executor")]
+                ]), parse_mode="HTML")
+            return
+
+        cheque=await xrocket.create_cheque(
+            amount, m.from_user.id,
+            description=f"TornadoPay withdrawal #{wid}",
+            client_cheque_id=f"tp-wd-{wid}"
+        )
+        link=cheque.get("link")
+        if not link:
+            raise RuntimeError("xRocket не вернул ссылку на чек")
+        provider_id=str(cheque.get("chequeId") or cheque.get("id") or "")
+        await set_withdrawal_provider(wid, "xrocket", provider_id, link, cheque.get("state", "active"))
+        await approve_withdrawal(wid, "xRocket cheque created")
+        await m.answer(
+            f"✅ <b>Вывод #{wid} создан автоматически.</b>\n\n"
+            f"Сумма: <b>{amount:.4f} USDT</b>\n"
+            f"Способ: <b>xRocket чек</b>\n\n"
+            "Чек уже готов и привязан к вашему Telegram-аккаунту.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚀 Открыть чек xRocket", url=link)],
+                [InlineKeyboardButton(text="⬅️ ЛК Исполнителя", callback_data="executor")]
+            ]), parse_mode="HTML")
+    except Exception as e:
+        print(f"[withdraw {provider}] {e}")
+        await reject_withdrawal(wid, f"{provider} error: {str(e)[:500]}")
+        await m.answer(
+            f"❌ Не удалось создать чек {('CryptoBot' if provider=='cryptobot' else 'xRocket')}. Средства возвращены на баланс.",
+            reply_markup=back())
 
 @dp.callback_query(F.data.startswith("exec:availability:"))
 async def executor_availability(c: CallbackQuery):
@@ -1751,37 +1804,85 @@ async def go_back(c: CallbackQuery, state: FSMContext):
     await c.answer()
 
 async def _xrocket_webhook_handler(request):
-    """Обрабатывает вебхук xRocket Pay об оплате счёта. Настраивается в
-    боте @xRocket на странице управления приложением (Rocket Pay ->
-    ваше приложение -> Webhook), URL: https://ваш-домен{XROCKET_WEBHOOK_PATH}."""
+    """Handle current xRocket Pay webhook events."""
     raw = await request.read()
-    signature = request.headers.get("rocket-pay-signature", "")
-    if not xrocket.verify_webhook_signature(raw, signature):
+
+    signature = request.headers.get("Signature", "")
+    signature_version = request.headers.get("Signature-Version", "")
+    signature_timestamp = request.headers.get("Signature-Timestamp", "")
+
+    if not xrocket.verify_webhook_signature(
+        raw,
+        signature,
+        signature_timestamp,
+        signature_version,
+    ):
         return web.Response(status=401, text="invalid signature")
+
     try:
         payload = json.loads(raw.decode("utf-8"))
     except Exception:
         return web.Response(status=400, text="invalid json")
-    if payload.get("type") != "invoicePay":
-        return web.Response(status=200, text="ignored")
+
+    ptype = payload.get("type")
     data = payload.get("data") or {}
-    invoice_id = data.get("id")
-    if invoice_id is None:
+
+    # xRocket personal cheque events are only informational for our internal
+    # balance: the executor's balance was already reserved and the withdrawal
+    # was marked paid when the cheque was successfully created. We still keep
+    # the provider state in sync and notify the executor on completion/error.
+    if ptype == "cheque":
+        cheque_id = data.get("chequeId")
+        if cheque_id:
+            w = await get_withdrawal_by_provider_id("xrocket", cheque_id)
+            if w:
+                state_value = data.get("state") or ("deleted" if data.get("deleted") else None)
+                if state_value:
+                    await set_withdrawal_provider_status(w["id"], str(state_value))
+                    if state_value == "completed":
+                        bot_instance = request.app.get("bot")
+                        if bot_instance is not None:
+                            try:
+                                await bot_instance.send_message(
+                                    w["user_id"],
+                                    f"✅ Чек xRocket по выводу #{w['id']} погашен на <b>{float(w['amount']):.4f} USDT</b>.",
+                                    parse_mode="HTML",
+                                )
+                            except Exception as e:
+                                print(f"[xrocket cheque notify] {e}")
+        return web.Response(status=200, text="ok")
+
+    if ptype != "invoice":
+        return web.Response(status=200, text="ignored")
+
+    event = data.get("event")
+    invoice = data.get("invoice") or {}
+    invoice_id = invoice.get("id")
+
+    if not invoice_id:
         return web.Response(status=400, text="no invoice id")
+
+    # Credit only on a completed payment. Current Pay API emits two invoice
+    # events for a successful payment; mark_deposit_paid is idempotent.
     payment = data.get("payment") or {}
-    paid_amount = payment.get("paymentAmountReceived") or payment.get("paymentAmount") or data.get("amount")
-    result = await mark_deposit_paid(invoice_id, paid_amount)
-    if result:
-        bot_instance = request.app.get("bot")
-        if bot_instance is not None:
-            try:
-                await bot_instance.send_message(
-                    result["user_id"],
-                    f"✅ Баланс пополнен на <b>{result['amount']:.4f} USDT</b> через xRocket.",
-                    parse_mode="HTML",
-                )
-            except Exception as e:
-                print(f"[xrocket webhook notify] {e}")
+    if event == "payment_status_changed":
+        finalized = payment.get("finalizedAt")
+        status = payment.get("status")
+        if finalized and status == "paid":
+            paid_amount = payment.get("receiveAmount") or payment.get("payAmount")
+            result = await mark_deposit_paid(invoice_id, paid_amount)
+            if result:
+                bot_instance = request.app.get("bot")
+                if bot_instance is not None:
+                    try:
+                        await bot_instance.send_message(
+                            result["user_id"],
+                            f"✅ Баланс пополнен на <b>{result['amount']:.4f} USDT</b> через xRocket.",
+                            parse_mode="HTML",
+                        )
+                    except Exception as e:
+                        print(f"[xrocket webhook notify] {e}")
+
     return web.Response(status=200, text="ok")
 
 
