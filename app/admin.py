@@ -1169,6 +1169,7 @@ async def admin_withdrawal_retry(c: CallbackQuery):
         await c.answer("Вывод уже обработан.", show_alert=True); return
     try:
         from . import cryptobot, xrocket
+        link = None
         if w[6] == "cryptobot":
             check=await cryptobot.create_check(float(w[3]))
             link=check.get("bot_check_url") or check.get("mini_app_check_url")

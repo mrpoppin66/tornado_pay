@@ -21,7 +21,7 @@ from .db import (
     confirm_order_by_client, dispute_order_by_client,
     get_order_chat_peer, save_order_chat_message, get_executor_active_order, get_executor_history,
     set_executor_card_details, get_executor_card_details, set_executor_card_reference, get_executor_card_reference,
-    create_withdrawal_request, set_withdrawal_provider, set_withdrawal_provider_status, mark_withdrawal_error, get_withdrawal_by_provider_id, get_user_transactions, get_chat_unread_count, get_chat_unread_for_orders,
+    create_withdrawal_request, set_withdrawal_provider, set_withdrawal_provider_status, mark_withdrawal_error, approve_withdrawal, get_withdrawal_by_provider_id, get_user_transactions, get_chat_unread_count, get_chat_unread_for_orders,
     mark_chat_read, get_recent_chat_messages, get_executor_detailed_stats,
     add_order_evidence, log_order_event, create_notification, get_notifications, get_notifications_count,
     get_unread_notifications_count, mark_notifications_read,
@@ -1686,8 +1686,12 @@ async def executor_withdraw_amount(m: Message, state: FSMContext):
         # Средства остаются зарезервированными во внутренней заявке до решения
         # администратора. Не сообщаем пользователю, что они уже возвращены.
         reason = str(e).replace("\n", " ")[:700]
+        if provider == "cryptobot":
+            error_title = "❌ Не удалось создать чек CryptoBot."
+        else:
+            error_title = "❌ Не удалось выполнить вывод через xRocket."
         await m.answer(
-            f"❌ Не удалось создать чек {('CryptoBot' if provider=='cryptobot' else 'xRocket')}.\n\n"
+            f"{error_title}\n\n"
             f"Заявка #{wid} передана в обработку администратору. Средства пока зарезервированы.\n\n"
             f"Причина: <code>{reason}</code>",
             reply_markup=InlineKeyboardMarkup(inline_keyboard=[
