@@ -819,7 +819,7 @@ async def approve_withdrawal(withdrawal_id, admin_comment=''):
     async with pool.acquire() as conn:
         async with conn.transaction():
             row=await conn.fetchrow("SELECT user_id,amount,status,wallet FROM withdrawal_requests WHERE id=$1 FOR UPDATE", withdrawal_id)
-            if not row or row[2] != 'pending':
+            if not row or row[2] not in ('pending', 'error'):
                 return None
             await conn.execute("UPDATE withdrawal_requests SET status='paid', admin_comment=$1, processed_at=now() WHERE id=$2", admin_comment, withdrawal_id)
             await conn.execute(

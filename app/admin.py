@@ -1109,7 +1109,7 @@ async def admin_withdrawals(c: CallbackQuery, state: FSMContext):
     await c.message.edit_text(text, reply_markup=_withdrawal_list_kb(rows), parse_mode="HTML")
     await c.answer()
 
-@admin_router.callback_query(F.data.startswith("adm:withdrawal:"))
+@admin_router.callback_query(F.data.regexp(r"^adm:withdrawal:\d+$"))
 async def admin_withdrawal_detail(c: CallbackQuery, state: FSMContext):
     await state.clear()
     wid=int(c.data.rsplit(":",1)[1])
