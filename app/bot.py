@@ -29,6 +29,7 @@ from .db import (
     get_user_agreement_accepted, accept_user_agreement,
     create_deposit, get_deposit_by_invoice, mark_deposit_paid, mark_deposit_expired,
     submit_order_rating,
+    is_payment_provider_enabled, get_payment_min_amount, PAYMENT_PROVIDER_LABELS,
 )
 from . import xrocket
 from . import cryptobot
@@ -530,33 +531,53 @@ async def profile_transactions(c: CallbackQuery):
     ]), parse_mode="HTML")
     await c.answer()
 
-MIN_DEPOSIT_USDT = 1.0
 DEPOSIT_EXPIRE_MINUTES = max(1, xrocket.DEPOSIT_EXPIRE_SECONDS // 60)
 
 @dp.callback_query(F.data == "profile:deposit")
 async def profile_deposit_start(c: CallbackQuery, state: FSMContext):
     await state.clear(); await state.set_state(UserStates.deposit_provider)
     rows=[]
-    if xrocket.is_configured(): rows.append([InlineKeyboardButton(text="🚀 xRocket", callback_data="dep:provider:xrocket")])
-    if cryptobot.is_configured(): rows.append([InlineKeyboardButton(text="🤖 CryptoBot", callback_data="dep:provider:cryptobot")])
+    notices=[]
+    if xrocket.is_configured():
+        if await is_payment_provider_enabled("xrocket", "deposit"):
+            rows.append([InlineKeyboardButton(text="🚀 xRocket", callback_data="dep:provider:xrocket")])
+        else:
+            rows.append([InlineKeyboardButton(text="🔧 xRocket (на тех. обслуживании)", callback_data="dep:provider:xrocket")])
+            notices.append("🚀 xRocket временно на техническом обслуживании.")
+    if cryptobot.is_configured():
+        if await is_payment_provider_enabled("cryptobot", "deposit"):
+            rows.append([InlineKeyboardButton(text="🤖 CryptoBot", callback_data="dep:provider:cryptobot")])
+        else:
+            rows.append([InlineKeyboardButton(text="🔧 CryptoBot (на тех. обслуживании)", callback_data="dep:provider:cryptobot")])
+            notices.append("🤖 CryptoBot временно на техническом обслуживании.")
     rows.append([InlineKeyboardButton(text="⬅️ Личный кабинет", callback_data="profile")])
-    await safe_edit(c, "💳 <b>Пополнение баланса</b>\n\nВыберите способ пополнения:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML"); await c.answer()
+    text = "💳 <b>Пополнение баланса</b>\n\nВыберите способ пополнения:"
+    if notices:
+        text += "\n\n" + "\n".join(notices)
+    await safe_edit(c, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML"); await c.answer()
 
 @dp.callback_query(F.data.startswith("dep:provider:"))
 async def profile_deposit_provider(c: CallbackQuery, state: FSMContext):
     provider=c.data.rsplit(":",1)[1]
     if provider not in ("xrocket","cryptobot") or (provider=="xrocket" and not xrocket.is_configured()) or (provider=="cryptobot" and not cryptobot.is_configured()):
         await c.answer("Этот способ временно недоступен.", show_alert=True); return
-    await state.update_data(deposit_provider=provider); await state.set_state(UserStates.deposit_amount)
+    if not await is_payment_provider_enabled(provider, "deposit"):
+        await c.answer(f"{PAYMENT_PROVIDER_LABELS.get(provider, provider)} временно на техническом обслуживании. Попробуйте позже или выберите другой способ.", show_alert=True); return
+    min_deposit = await get_payment_min_amount(provider, "deposit")
+    await state.update_data(deposit_provider=provider, deposit_min_amount=min_deposit); await state.set_state(UserStates.deposit_amount)
     name="xRocket" if provider=="xrocket" else "CryptoBot"
-    await safe_edit(c, f"💳 <b>Пополнение через {name}</b>\n\nВведите сумму в USDT (минимум {MIN_DEPOSIT_USDT:.0f} USDT):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="profile:deposit")]]), parse_mode="HTML"); await c.answer()
+    await safe_edit(c, f"💳 <b>Пополнение через {name}</b>\n\nВведите сумму в USDT (минимум {min_deposit:.2f} USDT):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="profile:deposit")]]), parse_mode="HTML"); await c.answer()
 
 @dp.message(UserStates.deposit_amount)
 async def profile_deposit_amount(m: Message, state: FSMContext):
     try: amount=float((m.text or "").strip().replace(",","."))
     except ValueError: await m.answer("Введите сумму числом, например 10 или 15.5"); return
-    if amount < MIN_DEPOSIT_USDT: await m.answer(f"Минимальная сумма пополнения — {MIN_DEPOSIT_USDT:.0f} USDT."); return
-    data=await state.get_data(); provider=data.get("deposit_provider"); await state.clear()
+    data=await state.get_data(); provider=data.get("deposit_provider")
+    min_deposit = float(data.get("deposit_min_amount") or await get_payment_min_amount(provider, "deposit"))
+    if amount < min_deposit: await m.answer(f"Минимальная сумма пополнения — {min_deposit:.2f} USDT."); return
+    if not await is_payment_provider_enabled(provider, "deposit"):
+        await state.clear(); await m.answer(f"{PAYMENT_PROVIDER_LABELS.get(provider, provider)} временно на техническом обслуживании. Попробуйте позже.", reply_markup=back()); return
+    await state.clear()
     try:
         if provider=="cryptobot":
             invoice=await cryptobot.create_invoice(amount, f"Пополнение TornadoPay (ID {m.from_user.id})", str(m.from_user.id)); key=f"cryptobot:{invoice['invoice_id']}"; link=invoice.get('mini_app_invoice_url') or invoice.get('bot_invoice_url'); name="CryptoBot"
@@ -1604,15 +1625,33 @@ async def executor_withdraw_start(c: CallbackQuery, state: FSMContext):
     if not u or u[3]!="executor" or u[8]: await c.answer("Доступ запрещён.", show_alert=True); return
     await state.clear(); await state.set_state(UserStates.withdrawal_provider)
     rows=[]
-    if xrocket.is_configured(): rows.append([InlineKeyboardButton(text="🚀 xRocket", callback_data="wd:provider:xrocket")])
-    if cryptobot.is_configured(): rows.append([InlineKeyboardButton(text="🤖 CryptoBot (чек)", callback_data="wd:provider:cryptobot")])
+    notices=[]
+    if xrocket.is_configured():
+        if await is_payment_provider_enabled("xrocket", "withdraw"):
+            rows.append([InlineKeyboardButton(text="🚀 xRocket", callback_data="wd:provider:xrocket")])
+        else:
+            rows.append([InlineKeyboardButton(text="🔧 xRocket (на тех. обслуживании)", callback_data="wd:provider:xrocket")])
+            notices.append("🚀 xRocket временно на техническом обслуживании.")
+    if cryptobot.is_configured():
+        if await is_payment_provider_enabled("cryptobot", "withdraw"):
+            rows.append([InlineKeyboardButton(text="🤖 CryptoBot (чек)", callback_data="wd:provider:cryptobot")])
+        else:
+            rows.append([InlineKeyboardButton(text="🔧 CryptoBot (на тех. обслуживании)", callback_data="wd:provider:cryptobot")])
+            notices.append("🤖 CryptoBot временно на техническом обслуживании.")
     rows.append([InlineKeyboardButton(text="⬅️ ЛК Исполнителя", callback_data="executor")])
-    await c.message.edit_text("💸 <b>Вывод средств</b>\n\nВыберите способ вывода:", reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML"); await c.answer()
+    text = "💸 <b>Вывод средств</b>\n\nВыберите способ вывода:"
+    if notices:
+        text += "\n\n" + "\n".join(notices)
+    await c.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=rows), parse_mode="HTML"); await c.answer()
 
 @dp.callback_query(F.data.startswith("wd:provider:"))
 async def executor_withdraw_provider(c: CallbackQuery, state: FSMContext):
-    provider=c.data.rsplit(":",1)[1]; await state.update_data(withdrawal_provider=provider); await state.set_state(UserStates.withdrawal_amount)
-    await c.message.edit_text(f"💸 <b>Вывод через {'CryptoBot чеком' if provider=='cryptobot' else 'xRocket'}</b>\n\nВведите сумму в USDT:", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="exec:withdraw")]]), parse_mode="HTML"); await c.answer()
+    provider=c.data.rsplit(":",1)[1]
+    if not await is_payment_provider_enabled(provider, "withdraw"):
+        await c.answer(f"{PAYMENT_PROVIDER_LABELS.get(provider, provider)} временно на техническом обслуживании. Попробуйте позже или выберите другой способ.", show_alert=True); return
+    min_withdraw = await get_payment_min_amount(provider, "withdraw")
+    await state.update_data(withdrawal_provider=provider, withdrawal_min_amount=min_withdraw); await state.set_state(UserStates.withdrawal_amount)
+    await c.message.edit_text(f"💸 <b>Вывод через {'CryptoBot чеком' if provider=='cryptobot' else 'xRocket'}</b>\n\nВведите сумму в USDT (минимум {min_withdraw:.2f} USDT):", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="exec:withdraw")]]), parse_mode="HTML"); await c.answer()
 
 @dp.message(UserStates.withdrawal_amount)
 async def executor_withdraw_amount(m: Message, state: FSMContext):
@@ -1620,6 +1659,10 @@ async def executor_withdraw_amount(m: Message, state: FSMContext):
     except ValueError: await m.answer("Введите сумму числом, например 25.5"); return
     data=await state.get_data(); provider=data.get("withdrawal_provider","xrocket")
     if amount<=0: await m.answer("Сумма должна быть больше нуля."); return
+    min_withdraw = float(data.get("withdrawal_min_amount") or await get_payment_min_amount(provider, "withdraw"))
+    if amount < min_withdraw: await m.answer(f"Минимальная сумма вывода — {min_withdraw:.2f} USDT."); return
+    if not await is_payment_provider_enabled(provider, "withdraw"):
+        await state.clear(); await m.answer(f"{PAYMENT_PROVIDER_LABELS.get(provider, provider)} временно на техническом обслуживании. Попробуйте позже.", reply_markup=back()); return
     u=await get_user(m.from_user.id)
     if not u or u[3]!="executor" or u[8]: await state.clear(); await m.answer("Доступ запрещён.", reply_markup=back()); return
     if amount>float(u[2])+1e-9: await m.answer(f"❌ Недостаточно средств. Доступно: {float(u[2]):.4f} USDT"); return

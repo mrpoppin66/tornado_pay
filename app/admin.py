@@ -30,6 +30,8 @@ from .db import (
     settle_order_executor, refund_order_client, get_pending_withdrawals, get_admin_withdrawals, approve_withdrawal, reject_withdrawal, force_refund_withdrawal, force_mark_withdrawal_paid, get_withdrawal, get_disputed_orders, get_recent_chat_messages,
     get_order_events, get_order_evidence, list_executors_admin, set_user_blocked_only, get_all_services_stats, set_service_max_amount, get_service_limits, get_user_blocked, get_user_block_info,
     log_order_event, create_notification, get_service,
+    get_payment_settings, set_payment_provider_enabled, set_payment_min_amount,
+    PAYMENT_PROVIDER_LABELS, PAYMENT_DIRECTION_LABELS,
 )
 
 ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_ID", "").split(",") if x.strip().isdigit()}
@@ -80,6 +82,7 @@ class AdminStates(StatesGroup):
     cash_amount = State()
     cash_withdraw_address = State()
     cash_withdraw_network = State()
+    waiting_payment_min_amount = State()
 
 
 def parse_positive_number(text):
@@ -191,6 +194,7 @@ def admin_menu_kb():
         [InlineKeyboardButton(text="👤 Пользователь", callback_data="adm:user")],
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
         [InlineKeyboardButton(text="💸 Выводы", callback_data="adm:withdrawals")],
+        [InlineKeyboardButton(text="💳 Платёжные системы", callback_data="adm:payments")],
     ])
 
 
@@ -1197,6 +1201,97 @@ async def admin_withdrawal_retry(c: CallbackQuery):
         await mark_withdrawal_error(wid, str(e)[:500])
         await c.answer(f"Ошибка: {str(e)[:150]}", show_alert=True)
     await admin_withdrawals(c, None)
+
+
+# ---------- Платёжные системы ----------
+
+def _payment_settings_text(settings):
+    lines = ["💳 <b>Платёжные системы</b>", "", "Настройка CryptoBot и xRocket: включение/отключение и минимальные суммы.", ""]
+    for provider in ("cryptobot", "xrocket"):
+        plabel = PAYMENT_PROVIDER_LABELS[provider]
+        icon = "🤖" if provider == "cryptobot" else "🚀"
+        lines.append(f"{icon} <b>{plabel}</b>")
+        for direction in ("deposit", "withdraw"):
+            dlabel = PAYMENT_DIRECTION_LABELS[direction]
+            enabled = settings.get(f"{provider}_{direction}_enabled", True)
+            min_amount = float(settings.get(f"{provider}_min_{direction}", 1.0))
+            status = "✅ включено" if enabled else "🔧 на тех. обслуживании"
+            lines.append(f"  {dlabel}: {status}, мин. {min_amount:.2f} USDT")
+        lines.append("")
+    return "\n".join(lines).rstrip()
+
+
+def _payment_settings_kb(settings):
+    kb = []
+    for provider in ("cryptobot", "xrocket"):
+        plabel = PAYMENT_PROVIDER_LABELS[provider]
+        icon = "🤖" if provider == "cryptobot" else "🚀"
+        for direction in ("deposit", "withdraw"):
+            dlabel = PAYMENT_DIRECTION_LABELS[direction]
+            enabled = settings.get(f"{provider}_{direction}_enabled", True)
+            toggle_text = f"{icon} {plabel} {dlabel}: {'выключить' if enabled else 'включить'}"
+            kb.append([InlineKeyboardButton(text=toggle_text, callback_data=f"adm:pay:toggle:{provider}:{direction}")])
+            kb.append([InlineKeyboardButton(text=f"✏️ Мин. сумма — {plabel} ({dlabel.lower()})", callback_data=f"adm:pay:setmin:{provider}:{direction}")])
+    kb.append([InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")])
+    return InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@admin_router.callback_query(F.data == "adm:payments")
+async def admin_payments(c: CallbackQuery, state: FSMContext):
+    if state:
+        await state.clear()
+    settings = await get_payment_settings()
+    await c.message.edit_text(_payment_settings_text(settings), reply_markup=_payment_settings_kb(settings), parse_mode="HTML")
+    await c.answer()
+
+
+@admin_router.callback_query(F.data.regexp(r"^adm:pay:toggle:(cryptobot|xrocket):(deposit|withdraw)$"))
+async def admin_payment_toggle(c: CallbackQuery, state: FSMContext):
+    _, _, _, provider, direction = c.data.split(":")
+    settings = await get_payment_settings()
+    currently_enabled = bool(settings.get(f"{provider}_{direction}_enabled", True))
+    await set_payment_provider_enabled(provider, direction, not currently_enabled)
+    settings = await get_payment_settings()
+    plabel = PAYMENT_PROVIDER_LABELS[provider]
+    dlabel = PAYMENT_DIRECTION_LABELS[direction]
+    await c.answer(
+        f"{plabel}: {dlabel.lower()} " + ("включено." if not currently_enabled else "отправлено на тех. обслуживание."),
+        show_alert=True,
+    )
+    await c.message.edit_text(_payment_settings_text(settings), reply_markup=_payment_settings_kb(settings), parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data.regexp(r"^adm:pay:setmin:(cryptobot|xrocket):(deposit|withdraw)$"))
+async def admin_payment_setmin_start(c: CallbackQuery, state: FSMContext):
+    _, _, _, provider, direction = c.data.split(":")
+    await state.update_data(payment_provider=provider, payment_direction=direction)
+    await state.set_state(AdminStates.waiting_payment_min_amount)
+    plabel = PAYMENT_PROVIDER_LABELS[provider]
+    dlabel = PAYMENT_DIRECTION_LABELS[direction]
+    await c.message.edit_text(
+        f"✏️ <b>Минимальная сумма — {plabel} ({dlabel.lower()})</b>\n\nВведите новую минимальную сумму в USDT:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:payments")]]),
+        parse_mode="HTML",
+    )
+    await c.answer()
+
+
+@admin_router.message(AdminStates.waiting_payment_min_amount)
+async def admin_payment_setmin_apply(m: Message, state: FSMContext):
+    amount = parse_positive_number(m.text)
+    if amount is None:
+        await m.answer("Нужно положительное число. Попробуйте ещё раз.")
+        return
+    data = await state.get_data()
+    provider = data.get("payment_provider")
+    direction = data.get("payment_direction")
+    await state.clear()
+    await set_payment_min_amount(provider, direction, amount)
+    settings = await get_payment_settings()
+    plabel = PAYMENT_PROVIDER_LABELS.get(provider, provider)
+    dlabel = PAYMENT_DIRECTION_LABELS.get(direction, direction)
+    await m.answer(f"✅ Минимальная сумма для {plabel} ({dlabel.lower()}) установлена: {amount:.2f} USDT.")
+    await m.answer(_payment_settings_text(settings), reply_markup=_payment_settings_kb(settings), parse_mode="HTML")
 
 
 # ---------- Статистика ----------

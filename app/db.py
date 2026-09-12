@@ -275,6 +275,19 @@ async def init_db():
         CREATE INDEX IF NOT EXISTS idx_deposits_user ON deposits(user_id, id);
         CREATE INDEX IF NOT EXISTS idx_deposits_status ON deposits(status, id);
 
+        CREATE TABLE IF NOT EXISTS payment_settings(
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            cryptobot_deposit_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            cryptobot_withdraw_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            xrocket_deposit_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            xrocket_withdraw_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+            cryptobot_min_deposit NUMERIC(14,4) NOT NULL DEFAULT 1.0,
+            cryptobot_min_withdraw NUMERIC(14,4) NOT NULL DEFAULT 1.0,
+            xrocket_min_deposit NUMERIC(14,4) NOT NULL DEFAULT 1.0,
+            xrocket_min_withdraw NUMERIC(14,4) NOT NULL DEFAULT 1.0,
+            CHECK (id = 1)
+        );
+
         """)
 
         # Миграции для старых баз: добавляем колонки, которых может не хватать
@@ -349,6 +362,18 @@ async def init_db():
         await conn.execute("UPDATE services SET payment_type='card' WHERE name ILIKE '%Перевод на карту%'")
         await conn.execute("UPDATE services SET payment_type='phone' WHERE name ILIKE '%Перевод по СБП%'")
         await conn.execute("UPDATE services SET payment_type='qr' WHERE name ILIKE '%Оплата по QR%'")
+
+        # Настройки платёжных систем: гарантируем наличие колонок (на случай
+        # апгрейда со старой версии таблицы) и единственной строки настроек.
+        await _add_column_if_missing(conn, "payment_settings", "cryptobot_deposit_enabled", "BOOLEAN NOT NULL DEFAULT TRUE")
+        await _add_column_if_missing(conn, "payment_settings", "cryptobot_withdraw_enabled", "BOOLEAN NOT NULL DEFAULT TRUE")
+        await _add_column_if_missing(conn, "payment_settings", "xrocket_deposit_enabled", "BOOLEAN NOT NULL DEFAULT TRUE")
+        await _add_column_if_missing(conn, "payment_settings", "xrocket_withdraw_enabled", "BOOLEAN NOT NULL DEFAULT TRUE")
+        await _add_column_if_missing(conn, "payment_settings", "cryptobot_min_deposit", "NUMERIC(14,4) NOT NULL DEFAULT 1.0")
+        await _add_column_if_missing(conn, "payment_settings", "cryptobot_min_withdraw", "NUMERIC(14,4) NOT NULL DEFAULT 1.0")
+        await _add_column_if_missing(conn, "payment_settings", "xrocket_min_deposit", "NUMERIC(14,4) NOT NULL DEFAULT 1.0")
+        await _add_column_if_missing(conn, "payment_settings", "xrocket_min_withdraw", "NUMERIC(14,4) NOT NULL DEFAULT 1.0")
+        await conn.execute("INSERT INTO payment_settings(id) VALUES(1) ON CONFLICT (id) DO NOTHING")
 
         # V10: состояние прочитанных сообщений
         await conn.execute("""CREATE TABLE IF NOT EXISTS order_chat_reads(order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, last_read_id BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(order_id,user_id)); CREATE INDEX IF NOT EXISTS idx_order_chat_reads_user ON order_chat_reads(user_id, order_id);""")
@@ -1251,6 +1276,63 @@ async def adjust_balance(user_id, delta, admin_comment=None):
                 user_id, delta, kind, description,
             )
             return new_balance
+
+# ---------- Настройки платёжных систем (CryptoBot / xRocket) ----------
+
+PAYMENT_PROVIDERS = ("cryptobot", "xrocket")
+PAYMENT_DIRECTIONS = ("deposit", "withdraw")
+
+PAYMENT_PROVIDER_LABELS = {"cryptobot": "CryptoBot", "xrocket": "xRocket"}
+PAYMENT_DIRECTION_LABELS = {"deposit": "Пополнение", "withdraw": "Вывод"}
+
+async def get_payment_settings():
+    """Возвращает текущие настройки платёжных систем одной строкой-словарём:
+    флаги включения пополнения/вывода и минимальные суммы по каждому провайдеру."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """SELECT cryptobot_deposit_enabled, cryptobot_withdraw_enabled,
+                      xrocket_deposit_enabled, xrocket_withdraw_enabled,
+                      cryptobot_min_deposit, cryptobot_min_withdraw,
+                      xrocket_min_deposit, xrocket_min_withdraw
+               FROM payment_settings WHERE id=1"""
+        )
+        if row is None:
+            # На случай гонки с миграцией — подстрахуемся дефолтами.
+            return {
+                "cryptobot_deposit_enabled": True, "cryptobot_withdraw_enabled": True,
+                "xrocket_deposit_enabled": True, "xrocket_withdraw_enabled": True,
+                "cryptobot_min_deposit": 1.0, "cryptobot_min_withdraw": 1.0,
+                "xrocket_min_deposit": 1.0, "xrocket_min_withdraw": 1.0,
+            }
+        return dict(row)
+
+async def is_payment_provider_enabled(provider, direction):
+    """Проверяет, включён ли провайдер (cryptobot/xrocket) для указанного
+    направления (deposit/withdraw)."""
+    settings = await get_payment_settings()
+    return bool(settings.get(f"{provider}_{direction}_enabled", True))
+
+async def get_payment_min_amount(provider, direction):
+    """Возвращает минимальную сумму (в USDT) для провайдера и направления."""
+    settings = await get_payment_settings()
+    return float(settings.get(f"{provider}_min_{direction}", 1.0))
+
+async def set_payment_provider_enabled(provider, direction, enabled):
+    if provider not in PAYMENT_PROVIDERS or direction not in PAYMENT_DIRECTIONS:
+        raise ValueError("Неизвестный провайдер или направление")
+    column = f"{provider}_{direction}_enabled"
+    async with pool.acquire() as conn:
+        await conn.execute(f"UPDATE payment_settings SET {column}=$1 WHERE id=1", bool(enabled))
+
+async def set_payment_min_amount(provider, direction, amount):
+    if provider not in PAYMENT_PROVIDERS or direction not in PAYMENT_DIRECTIONS:
+        raise ValueError("Неизвестный провайдер или направление")
+    amount = float(amount)
+    if amount <= 0:
+        raise ValueError("Сумма должна быть больше нуля")
+    column = f"{provider}_min_{direction}"
+    async with pool.acquire() as conn:
+        await conn.execute(f"UPDATE payment_settings SET {column}=$1 WHERE id=1", amount)
 
 # ---------- Депозиты (пополнение через xRocket) ----------
 
