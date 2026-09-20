@@ -32,13 +32,47 @@ from .db import (
     log_order_event, create_notification, get_service,
     get_payment_settings, set_payment_provider_enabled, set_payment_min_amount,
     PAYMENT_PROVIDER_LABELS, PAYMENT_DIRECTION_LABELS,
+    get_referral_settings, set_referral_percent, set_referral_flat_bonus, get_referral_admin_stats,
+    credit_referral_order_commission, get_admin_analytics, get_top_referrers,
+    get_order_settings, set_auto_dispute_timeout_minutes,
+    get_db_admin_ids, list_admins_detailed, add_admin, remove_admin,
 )
 
-ADMIN_IDS = {int(x) for x in os.getenv("ADMIN_ID", "").split(",") if x.strip().isdigit()}
+# Администраторы, заданные через переменную окружения ADMIN_ID — их нельзя
+# снять из панели (страховка от потери доступа к боту). Дополнительные
+# администраторы, назначенные через панель, хранятся в таблице admins.
+ENV_ADMIN_IDS = frozenset(int(x) for x in os.getenv("ADMIN_ID", "").split(",") if x.strip().isdigit())
+
+async def get_admin_ids():
+    """Полный актуальный список ID администраторов: заданные через ADMIN_ID
+    плюс назначенные через админ-панель."""
+    db_ids = await get_db_admin_ids()
+    return ENV_ADMIN_IDS | db_ids
+
+async def list_all_admins():
+    """Список всех администраторов с пометкой источника — для экрана
+    управления администраторами."""
+    db_rows = await list_admins_detailed()
+    result = [
+        {"user_id": uid, "username": None, "source": "env", "created_at": None}
+        for uid in sorted(ENV_ADMIN_IDS)
+    ]
+    for r in db_rows:
+        result.append({
+            "user_id": int(r["user_id"]),
+            "username": r["username"],
+            "source": "panel",
+            "created_at": r["created_at"],
+        })
+    return result
+
+async def _is_admin_event(event) -> bool:
+    admin_ids = await get_admin_ids()
+    return bool(event.from_user) and event.from_user.id in admin_ids
 
 admin_router = Router()
-admin_router.message.filter(F.from_user.id.in_(ADMIN_IDS))
-admin_router.callback_query.filter(F.from_user.id.in_(ADMIN_IDS))
+admin_router.message.filter(_is_admin_event)
+admin_router.callback_query.filter(_is_admin_event)
 
 
 async def notify_new_withdrawal(withdrawal_id, bot: Bot):
@@ -54,7 +88,8 @@ async def notify_new_withdrawal(withdrawal_id, bot: Bot):
         "Откройте «💸 Выводы» в админ-панели для просмотра, возврата средств "
         "или повторной автоматической выплаты."
     )
-    for admin_id in ADMIN_IDS:
+    admin_ids = await get_admin_ids()
+    for admin_id in admin_ids:
         try:
             await bot.send_message(admin_id, text, parse_mode="HTML")
         except Exception as e:
@@ -83,6 +118,10 @@ class AdminStates(StatesGroup):
     cash_withdraw_address = State()
     cash_withdraw_network = State()
     waiting_payment_min_amount = State()
+    waiting_referral_percent = State()
+    waiting_referral_flat_bonus = State()
+    waiting_auto_dispute_timeout = State()
+    waiting_new_admin_id = State()
 
 
 def parse_positive_number(text):
@@ -195,6 +234,9 @@ def admin_menu_kb():
         [InlineKeyboardButton(text="📊 Статистика", callback_data="adm:stats")],
         [InlineKeyboardButton(text="💸 Выводы", callback_data="adm:withdrawals")],
         [InlineKeyboardButton(text="💳 Платёжные системы", callback_data="adm:payments")],
+        [InlineKeyboardButton(text="🤝 Реферальная система", callback_data="adm:referrals")],
+        [InlineKeyboardButton(text="⏱ Настройки заявок", callback_data="adm:ordersettings")],
+        [InlineKeyboardButton(text="👑 Администраторы", callback_data="adm:admins")],
     ])
 
 
@@ -219,7 +261,7 @@ async def notify_new_executor_application(application_id, bot: Bot):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Открыть заявку", callback_data=f"adm:execapp:{app[0]}")]
     ])
-    for admin_id in ADMIN_IDS:
+    for admin_id in await get_admin_ids():
         try:
             await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
         except Exception as e:
@@ -241,7 +283,7 @@ async def notify_executor_application_answer(application_id, bot: Bot):
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📋 Открыть заявку", callback_data=f"adm:execapp:{app[0]}")]
     ])
-    for admin_id in ADMIN_IDS:
+    for admin_id in await get_admin_ids():
         try:
             await bot.send_message(admin_id, text, reply_markup=kb, parse_mode="HTML")
         except Exception as e:
@@ -273,7 +315,7 @@ async def admin_entry(m: Message, state: FSMContext):
 async def emoji_id_prompt(m: Message, state: FSMContext):
     """Служебная команда для админа: узнать custom_emoji_id премиум-эмодзи,
     чтобы использовать их на кнопках (InlineKeyboardButton.icon_custom_emoji_id)."""
-    if m.from_user.id not in ADMIN_IDS:
+    if m.from_user.id not in await get_admin_ids():
         return
     await state.set_state(AdminStates.waiting_emoji_probe)
     await m.answer(
@@ -285,7 +327,7 @@ async def emoji_id_prompt(m: Message, state: FSMContext):
 
 @admin_router.message(AdminStates.waiting_emoji_probe)
 async def emoji_id_capture(m: Message, state: FSMContext):
-    if m.from_user.id not in ADMIN_IDS:
+    if m.from_user.id not in await get_admin_ids():
         return
     await state.clear()
     entities = m.entities or []
@@ -523,6 +565,14 @@ async def admin_settle(c: CallbackQuery):
             try:
                 await c.bot.send_message(executor_id, f"🎉 <b>Заявка #{order_id} завершена администрацией</b>\n\nВам начислено <b>{payout:.4f} USDT</b>.", parse_mode="HTML")
             except Exception as e: print(f"[Admin payout notify] {e}")
+            referral_result = await credit_referral_order_commission(order_id)
+            if referral_result:
+                try:
+                    await c.bot.send_message(
+                        referral_result["referrer_id"],
+                        f"🤝 <b>Реферальное вознаграждение</b>\n\nНачислено <b>{referral_result['amount']:.4f} USDT</b> за заявку вашего реферала #{order_id}.",
+                        parse_mode="HTML")
+                except Exception as e: print(f"[referral notify admin settle] {e}")
             o_full = await get_order(order_id)
             if o_full:
                 from .bot import rating_kb
@@ -1294,12 +1344,287 @@ async def admin_payment_setmin_apply(m: Message, state: FSMContext):
     await m.answer(_payment_settings_text(settings), reply_markup=_payment_settings_kb(settings), parse_mode="HTML")
 
 
+# ---------- Реферальная система ----------
+
+def _referral_settings_text(settings, stats):
+    return (
+        "🤝 <b>Реферальная программа</b>\n\n"
+        f"Процент от комиссии платформы за каждую завершённую заявку реферала: <b>{settings['percent']:.2f}%</b>\n"
+        f"Разовый бонус за первое пополнение реферала: <b>{settings['flat_bonus']:.2f} USDT</b>\n\n"
+        f"Пригласивших пользователей: {stats['referrers']}\n"
+        f"Приглашённых пользователей: {stats['referred_users']}\n"
+        f"Всего выплачено по программе: {stats['total_paid']:.4f} USDT"
+    )
+
+
+def _referral_settings_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить процент", callback_data="adm:ref:setpercent")],
+        [InlineKeyboardButton(text="✏️ Изменить бонус за реферала", callback_data="adm:ref:setbonus")],
+        [InlineKeyboardButton(text="🏆 Топ рефереров", callback_data="adm:ref:top")],
+        [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")],
+    ])
+
+
+@admin_router.callback_query(F.data == "adm:referrals")
+async def admin_referrals(c: CallbackQuery, state: FSMContext):
+    if state:
+        await state.clear()
+    settings = await get_referral_settings()
+    stats = await get_referral_admin_stats()
+    await c.message.edit_text(_referral_settings_text(settings, stats), reply_markup=_referral_settings_kb(), parse_mode="HTML")
+    await c.answer()
+
+
+@admin_router.callback_query(F.data == "adm:ref:setpercent")
+async def admin_referral_setpercent_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_referral_percent)
+    await c.message.edit_text(
+        "✏️ <b>Процент реферального вознаграждения</b>\n\n"
+        "Введите процент от комиссии платформы (0–100), который будет начисляться "
+        "рефереру за каждую завершённую заявку приглашённого пользователя. "
+        "Введите 0, чтобы отключить.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:referrals")]]),
+        parse_mode="HTML",
+    )
+    await c.answer()
+
+
+@admin_router.message(AdminStates.waiting_referral_percent)
+async def admin_referral_setpercent_apply(m: Message, state: FSMContext):
+    text = (m.text or "").strip().replace(",", ".")
+    try:
+        value = float(text)
+    except ValueError:
+        await m.answer("Нужно число от 0 до 100. Попробуйте ещё раз.")
+        return
+    if value < 0 or value > 100:
+        await m.answer("Процент должен быть в диапазоне от 0 до 100.")
+        return
+    await state.clear()
+    await set_referral_percent(value)
+    settings = await get_referral_settings()
+    stats = await get_referral_admin_stats()
+    await m.answer(f"✅ Процент реферального вознаграждения установлен: {value:.2f}%.")
+    await m.answer(_referral_settings_text(settings, stats), reply_markup=_referral_settings_kb(), parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data == "adm:ref:setbonus")
+async def admin_referral_setbonus_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_referral_flat_bonus)
+    await c.message.edit_text(
+        "✏️ <b>Бонус за реферала</b>\n\n"
+        "Введите сумму в USDT (0 — чтобы отключить), которая будет разово начисляться "
+        "пригласившему после первого успешного пополнения приглашённого пользователя.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:referrals")]]),
+        parse_mode="HTML",
+    )
+    await c.answer()
+
+
+@admin_router.message(AdminStates.waiting_referral_flat_bonus)
+async def admin_referral_setbonus_apply(m: Message, state: FSMContext):
+    text = (m.text or "").strip().replace(",", ".")
+    try:
+        value = float(text)
+    except ValueError:
+        await m.answer("Нужно неотрицательное число. Попробуйте ещё раз.")
+        return
+    if value < 0:
+        await m.answer("Сумма не может быть отрицательной.")
+        return
+    await state.clear()
+    await set_referral_flat_bonus(value)
+    settings = await get_referral_settings()
+    stats = await get_referral_admin_stats()
+    await m.answer(f"✅ Бонус за реферала установлен: {value:.2f} USDT.")
+    await m.answer(_referral_settings_text(settings, stats), reply_markup=_referral_settings_kb(), parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data == "adm:ref:top")
+async def admin_referrals_top(c: CallbackQuery, state: FSMContext):
+    if state:
+        await state.clear()
+    rows = await get_top_referrers(10)
+    if not rows:
+        text = "🏆 <b>Топ рефереров</b>\n\nПока никто не привёл ни одного реферала."
+    else:
+        lines = ["🏆 <b>Топ рефереров</b>", ""]
+        for i, r in enumerate(rows, 1):
+            label = f"@{r['username']}" if r["username"] else str(r["user_id"])
+            lines.append(
+                f"{i}. {label} (<code>{r['user_id']}</code>) — "
+                f"{r['referred_count']} реф., заработано {float(r['total_earned']):.4f} USDT"
+            )
+        text = "\n".join(lines)
+    await c.message.edit_text(
+        text,
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="adm:referrals")]]),
+        parse_mode="HTML",
+    )
+    await c.answer()
+
+
+# ---------- Настройки заявок ----------
+
+def _order_settings_text(settings):
+    return (
+        "⏱ <b>Настройки заявок</b>\n\n"
+        "Если исполнитель отметил заявку выполненной, а клиент не подтвердил "
+        "и не открыл спор сам — заявка автоматически переводится в спор для "
+        "решения администрацией.\n\n"
+        f"Текущий тайм-аут: <b>{settings['auto_dispute_timeout_minutes']} мин.</b>"
+    )
+
+
+def _order_settings_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить тайм-аут", callback_data="adm:ordset:settimeout")],
+        [InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")],
+    ])
+
+
+@admin_router.callback_query(F.data == "adm:ordersettings")
+async def admin_order_settings(c: CallbackQuery, state: FSMContext):
+    if state:
+        await state.clear()
+    settings = await get_order_settings()
+    await c.message.edit_text(_order_settings_text(settings), reply_markup=_order_settings_kb(), parse_mode="HTML")
+    await c.answer()
+
+
+@admin_router.callback_query(F.data == "adm:ordset:settimeout")
+async def admin_order_settings_settimeout_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_auto_dispute_timeout)
+    await c.message.edit_text(
+        "✏️ <b>Тайм-аут авто-эскалации в спор</b>\n\n"
+        "Введите целое число минут — через сколько неподтверждённая клиентом "
+        "заявка автоматически перейдёт в статус «спор» (например, 60):",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:ordersettings")]]),
+        parse_mode="HTML",
+    )
+    await c.answer()
+
+
+@admin_router.message(AdminStates.waiting_auto_dispute_timeout)
+async def admin_order_settings_settimeout_apply(m: Message, state: FSMContext):
+    text = (m.text or "").strip()
+    if not text.isdigit():
+        await m.answer("Нужно целое число минут (например, 60). Попробуйте ещё раз.")
+        return
+    minutes = int(text)
+    if minutes < 1:
+        await m.answer("Тайм-аут должен быть не меньше 1 минуты.")
+        return
+    await state.clear()
+    await set_auto_dispute_timeout_minutes(minutes)
+    settings = await get_order_settings()
+    await m.answer(f"✅ Тайм-аут авто-эскалации установлен: {minutes} мин.")
+    await m.answer(_order_settings_text(settings), reply_markup=_order_settings_kb(), parse_mode="HTML")
+
+
+# ---------- Администраторы ----------
+
+def _render_admins_list(admins):
+    lines = [
+        "👑 <b>Администраторы бота</b>",
+        "",
+        "🔒 — задан через переменную окружения ADMIN_ID на сервере, снять права через панель нельзя.",
+        "👤 — назначен через панель, имеет точно такие же полные права.",
+        "",
+    ]
+    kb = []
+    for a in admins:
+        label = f"@{a['username']}" if a.get("username") else str(a["user_id"])
+        if a["source"] == "env":
+            lines.append(f"🔒 {label} (<code>{a['user_id']}</code>)")
+        else:
+            lines.append(f"👤 {label} (<code>{a['user_id']}</code>)")
+            kb.append([InlineKeyboardButton(text=f"➖ Снять права — {label}", callback_data=f"adm:admins:remove:{a['user_id']}")])
+    kb.append([InlineKeyboardButton(text="➕ Добавить администратора", callback_data="adm:admins:add")])
+    kb.append([InlineKeyboardButton(text="⬅️ Админ-меню", callback_data="adm:menu")])
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=kb)
+
+
+@admin_router.callback_query(F.data == "adm:admins")
+async def admin_admins_list(c: CallbackQuery, state: FSMContext):
+    if state:
+        await state.clear()
+    admins = await list_all_admins()
+    text, kb = _render_admins_list(admins)
+    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+    await c.answer()
+
+
+@admin_router.callback_query(F.data == "adm:admins:add")
+async def admin_admins_add_start(c: CallbackQuery, state: FSMContext):
+    await state.set_state(AdminStates.waiting_new_admin_id)
+    await c.message.edit_text(
+        "➕ <b>Новый администратор</b>\n\n"
+        "Отправьте Telegram ID пользователя, которого нужно назначить администратором "
+        "(у него будут точно такие же полные права, как у вас).\n\n"
+        "Узнать свой ID пользователь может, например, у бота @userinfobot. "
+        "Желательно, чтобы он уже хотя бы раз запускал этого бота (/start) — "
+        "иначе бот не сможет определить его username и, возможно, не сможет "
+        "прислать ему уведомление о назначении.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Отмена", callback_data="adm:admins")]]),
+        parse_mode="HTML",
+    )
+    await c.answer()
+
+
+@admin_router.message(AdminStates.waiting_new_admin_id)
+async def admin_admins_add_apply(m: Message, state: FSMContext):
+    text = (m.text or "").strip().lstrip("@")
+    if not text.isdigit():
+        await m.answer("Нужен числовой Telegram ID (не username). Попробуйте ещё раз.")
+        return
+    new_admin_id = int(text)
+    await state.clear()
+    username = None
+    try:
+        chat = await m.bot.get_chat(new_admin_id)
+        username = chat.username
+    except Exception:
+        pass
+    await add_admin(new_admin_id, username, added_by=m.from_user.id)
+    label = f"@{username}" if username else str(new_admin_id)
+    await m.answer(f"✅ {label} (<code>{new_admin_id}</code>) назначен администратором с полными правами.", parse_mode="HTML")
+    try:
+        await m.bot.send_message(
+            new_admin_id,
+            "🛠 Вам предоставлены права администратора. Отправьте /start — в главном меню появится кнопка «Админ-панель».",
+        )
+    except Exception as e:
+        print(f"[new admin notify] {e}")
+    admins = await list_all_admins()
+    text2, kb2 = _render_admins_list(admins)
+    await m.answer(text2, reply_markup=kb2, parse_mode="HTML")
+
+
+@admin_router.callback_query(F.data.regexp(r"^adm:admins:remove:\d+$"))
+async def admin_admins_remove(c: CallbackQuery, state: FSMContext):
+    target_id = int(c.data.rsplit(":", 1)[1])
+    if target_id in ENV_ADMIN_IDS:
+        await c.answer("Этого администратора нельзя снять из панели — он задан через переменную окружения на сервере.", show_alert=True)
+        return
+    if target_id == c.from_user.id:
+        await c.answer("Нельзя снять права администратора с самого себя.", show_alert=True)
+        return
+    removed = await remove_admin(target_id)
+    await c.answer("Права администратора сняты." if removed else "Этот пользователь не найден в списке администраторов.", show_alert=True)
+    admins = await list_all_admins()
+    text, kb = _render_admins_list(admins)
+    await c.message.edit_text(text, reply_markup=kb, parse_mode="HTML")
+
+
 # ---------- Статистика ----------
 
 @admin_router.callback_query(F.data == "adm:stats")
 async def admin_stats(c: CallbackQuery, state: FSMContext):
     await state.clear()
     s = await get_stats()
+    a = await get_admin_analytics()
     rate = get_exchange_rate()
     by_status = s["orders_by_status"]
     lines = [f"{ORDER_STATUS_LABELS.get(k, k)}: {v}" for k, v in by_status.items()]
@@ -1310,6 +1635,17 @@ async def admin_stats(c: CallbackQuery, state: FSMContext):
         f"Заявок всего: {s['orders']}\n\n"
         f"Текущий курс: 1 USDT = {rate:.2f} RUB\n\n"
         + ("\n".join(lines) if lines else "Заявок пока нет.")
+        + "\n\n"
+        "💰 <b>Выручка платформы (комиссия)</b>\n"
+        f"За 24 часа: {a['rev_1d']:.4f} USDT\n"
+        f"За 7 дней: {a['rev_7d']:.4f} USDT\n"
+        f"За 30 дней: {a['rev_30d']:.4f} USDT\n"
+        f"Всего: {a['rev_total']:.4f} USDT\n\n"
+        "📈 <b>Динамика</b>\n"
+        f"Новых пользователей (24ч / 7д / 30д): {a['new_users_1d']} / {a['new_users_7d']} / {a['new_users_30d']}\n"
+        f"Новых заявок (24ч / 7д / 30д): {a['orders_1d']} / {a['orders_7d']} / {a['orders_30d']}\n"
+        f"Средний чек (завершённые заявки): {a['avg_check_rub']:.2f} RUB\n\n"
+        f"🤝 Выплачено по реферальной программе: {a['referral_paid_total']:.4f} USDT"
     )
     await c.message.edit_text(text, reply_markup=admin_back_kb(), parse_mode="HTML")
     await c.answer()

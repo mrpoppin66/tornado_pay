@@ -288,6 +288,37 @@ async def init_db():
             CHECK (id = 1)
         );
 
+        CREATE TABLE IF NOT EXISTS referral_settings(
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            percent NUMERIC(5,2) NOT NULL DEFAULT 0,
+            flat_bonus NUMERIC(14,4) NOT NULL DEFAULT 0,
+            CHECK (id = 1)
+        );
+        CREATE TABLE IF NOT EXISTS referral_bonuses(
+            id BIGSERIAL PRIMARY KEY,
+            referrer_id BIGINT NOT NULL REFERENCES users(user_id),
+            referral_id BIGINT NOT NULL REFERENCES users(user_id),
+            order_id INTEGER REFERENCES orders(id),
+            amount NUMERIC(18,4) NOT NULL,
+            kind TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+        CREATE INDEX IF NOT EXISTS idx_referral_bonuses_referrer ON referral_bonuses(referrer_id, id);
+        CREATE INDEX IF NOT EXISTS idx_referral_bonuses_referral_kind ON referral_bonuses(referral_id, kind);
+
+        CREATE TABLE IF NOT EXISTS order_settings(
+            id INTEGER PRIMARY KEY DEFAULT 1,
+            auto_dispute_timeout_minutes INTEGER NOT NULL DEFAULT 60,
+            CHECK (id = 1)
+        );
+
+        CREATE TABLE IF NOT EXISTS admins(
+            user_id BIGINT PRIMARY KEY,
+            username TEXT,
+            added_by BIGINT,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        );
+
         """)
 
         # Миграции для старых баз: добавляем колонки, которых может не хватать
@@ -374,6 +405,18 @@ async def init_db():
         await _add_column_if_missing(conn, "payment_settings", "xrocket_min_deposit", "NUMERIC(14,4) NOT NULL DEFAULT 1.0")
         await _add_column_if_missing(conn, "payment_settings", "xrocket_min_withdraw", "NUMERIC(14,4) NOT NULL DEFAULT 1.0")
         await conn.execute("INSERT INTO payment_settings(id) VALUES(1) ON CONFLICT (id) DO NOTHING")
+
+        # Реферальная система: колонка привязки реферера у пользователей и
+        # гарантия наличия единственной строки настроек.
+        await _add_column_if_missing(conn, "users", "referrer_id", "BIGINT")
+        await _add_column_if_missing(conn, "referral_settings", "percent", "NUMERIC(5,2) NOT NULL DEFAULT 0")
+        await _add_column_if_missing(conn, "referral_settings", "flat_bonus", "NUMERIC(14,4) NOT NULL DEFAULT 0")
+        await conn.execute("INSERT INTO referral_settings(id) VALUES(1) ON CONFLICT (id) DO NOTHING")
+
+        # Настройки заявок (тайм-аут авто-эскалации в спор) и таблица
+        # дополнительных администраторов, назначаемых через панель.
+        await _add_column_if_missing(conn, "order_settings", "auto_dispute_timeout_minutes", "INTEGER NOT NULL DEFAULT 60")
+        await conn.execute("INSERT INTO order_settings(id) VALUES(1) ON CONFLICT (id) DO NOTHING")
 
         # V10: состояние прочитанных сообщений
         await conn.execute("""CREATE TABLE IF NOT EXISTS order_chat_reads(order_id INTEGER NOT NULL REFERENCES orders(id) ON DELETE CASCADE, user_id BIGINT NOT NULL REFERENCES users(user_id) ON DELETE CASCADE, last_read_id BIGINT NOT NULL DEFAULT 0, updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(order_id,user_id)); CREATE INDEX IF NOT EXISTS idx_order_chat_reads_user ON order_chat_reads(user_id, order_id);""")
@@ -692,6 +735,39 @@ async def dispute_order_by_client(order_id, client_id):
                WHERE id=$1 AND user_id=$2 AND status='awaiting_confirmation'
                RETURNING executor_id""", order_id, client_id)
         return row[0] if row else None
+
+async def auto_dispute_stale_orders(timeout_minutes=60):
+    """Автоматически переводит в статус 'disputed' все заявки, которые
+    дольше timeout_minutes минут висят в 'awaiting_confirmation' (исполнитель
+    отметил заявку выполненной, а клиент её не подтвердил и не открыл спор
+    сам). Возвращает список данных по каждой переведённой заявке — для
+    последующих уведомлений клиенту, исполнителю и админам."""
+    async with pool.acquire() as conn:
+        candidates = await conn.fetch(
+            """SELECT o.id, o.user_id, o.executor_id, s.name
+               FROM orders o JOIN services s ON s.id=o.service_id
+               WHERE o.status='awaiting_confirmation'
+                 AND o.completed_at IS NOT NULL
+                 AND o.completed_at <= now() - ($1 || ' minutes')::interval""",
+            str(timeout_minutes),
+        )
+        results = []
+        for r in candidates:
+            # Повторная проверка статуса прямо в UPDATE — защита от гонки,
+            # если заявку успели обработать (подтвердить/оспорить) между
+            # выборкой кандидатов и этим шагом.
+            updated_id = await conn.fetchval(
+                "UPDATE orders SET status='disputed', disputed_at=now() WHERE id=$1 AND status='awaiting_confirmation' RETURNING id",
+                r["id"],
+            )
+            if updated_id:
+                results.append({
+                    "order_id": r["id"],
+                    "client_id": r["user_id"],
+                    "executor_id": r["executor_id"],
+                    "service_name": r["name"],
+                })
+        return results
 
 async def get_executor_orders(executor_id, status=None):
     """Получить заявки исполнителя"""
@@ -1334,6 +1410,168 @@ async def set_payment_min_amount(provider, direction, amount):
     async with pool.acquire() as conn:
         await conn.execute(f"UPDATE payment_settings SET {column}=$1 WHERE id=1", amount)
 
+# ---------- Реферальная система ----------
+
+async def get_referral_settings():
+    """Текущие настройки реферальной программы: процент от комиссии
+    платформы за заявки рефералов и разовый бонус за приглашённого."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT percent, flat_bonus FROM referral_settings WHERE id=1")
+        if row is None:
+            return {"percent": 0.0, "flat_bonus": 0.0}
+        return {"percent": float(row["percent"]), "flat_bonus": float(row["flat_bonus"])}
+
+async def set_referral_percent(value):
+    value = float(value)
+    if value < 0 or value > 100:
+        raise ValueError("Процент должен быть от 0 до 100")
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE referral_settings SET percent=$1 WHERE id=1", value)
+
+async def set_referral_flat_bonus(value):
+    value = float(value)
+    if value < 0:
+        raise ValueError("Сумма не может быть отрицательной")
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE referral_settings SET flat_bonus=$1 WHERE id=1", value)
+
+async def set_user_referrer(user_id, referrer_id):
+    """Фиксирует, кто пригласил пользователя. Срабатывает только один раз —
+    если у пользователя уже есть referrer_id, ничего не меняется. Нельзя
+    указать самого себя реферером. Возвращает True, если реферер был
+    успешно установлен."""
+    if not referrer_id:
+        return False
+    referrer_id = int(referrer_id)
+    if referrer_id == int(user_id):
+        return False
+    async with pool.acquire() as conn:
+        referrer_exists = await conn.fetchval("SELECT 1 FROM users WHERE user_id=$1", referrer_id)
+        if not referrer_exists:
+            return False
+        row = await conn.fetchrow(
+            "UPDATE users SET referrer_id=$1 WHERE user_id=$2 AND referrer_id IS NULL RETURNING user_id",
+            referrer_id, user_id)
+        return bool(row)
+
+async def get_referral_stats(user_id):
+    """Сколько людей привёл пользователь и сколько всего заработал на
+    реферальной программе."""
+    async with pool.acquire() as conn:
+        count = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referrer_id=$1", user_id)
+        total = await conn.fetchval("SELECT COALESCE(SUM(amount),0) FROM referral_bonuses WHERE referrer_id=$1", user_id)
+        return {"count": int(count or 0), "total_earned": float(total or 0)}
+
+async def get_referral_admin_stats():
+    """Сводная статистика реферальной программы для админ-панели."""
+    async with pool.acquire() as conn:
+        referred_users = await conn.fetchval("SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL")
+        referrers = await conn.fetchval("SELECT COUNT(DISTINCT referrer_id) FROM users WHERE referrer_id IS NOT NULL")
+        total_paid = await conn.fetchval("SELECT COALESCE(SUM(amount),0) FROM referral_bonuses")
+        return {
+            "referred_users": int(referred_users or 0),
+            "referrers": int(referrers or 0),
+            "total_paid": float(total_paid or 0),
+        }
+
+async def credit_referral_order_commission(order_id):
+    """Начисляет рефереру процент от комиссии платформы по заявке клиента —
+    один раз на заявку. Вызывается после того, как заявка перешла в статус
+    'done' и комиссия фактически удержана (подтверждение клиентом или
+    решение администрации в пользу исполнителя)."""
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            order = await conn.fetchrow(
+                "SELECT user_id, owner_commission_amount, status FROM orders WHERE id=$1 FOR UPDATE", order_id)
+            if not order or order["status"] != "done":
+                return None
+            already = await conn.fetchval(
+                "SELECT 1 FROM referral_bonuses WHERE order_id=$1 AND kind='order_percent'", order_id)
+            if already:
+                return None
+            referrer_id = await conn.fetchval("SELECT referrer_id FROM users WHERE user_id=$1", order["user_id"])
+            if not referrer_id:
+                return None
+            settings = await conn.fetchrow("SELECT percent FROM referral_settings WHERE id=1")
+            percent = float(settings["percent"]) if settings else 0.0
+            if percent <= 0:
+                return None
+            amount = float(order["owner_commission_amount"]) * percent / 100.0
+            if amount <= 0:
+                return None
+            await conn.execute("UPDATE users SET balance=balance+$1 WHERE user_id=$2", amount, referrer_id)
+            await conn.execute(
+                "INSERT INTO transactions(user_id,order_id,amount,type,description) VALUES($1,$2,$3,'referral_bonus',$4)",
+                referrer_id, order_id, amount, f"Реферальные {percent:.2f}% по заявке #{order_id}")
+            await conn.execute(
+                "INSERT INTO referral_bonuses(referrer_id,referral_id,order_id,amount,kind) VALUES($1,$2,$3,$4,'order_percent')",
+                referrer_id, order["user_id"], order_id, amount)
+            return {"referrer_id": referrer_id, "amount": amount}
+
+async def get_top_referrers(limit=10):
+    """Топ рефереров по заработку на реферальной программе — для админ-панели."""
+    async with pool.acquire() as conn:
+        return await conn.fetch(
+            """SELECT ref.user_id, ref.username,
+                      COUNT(u.user_id) AS referred_count,
+                      COALESCE(rb.total_earned, 0) AS total_earned
+               FROM users ref
+               JOIN users u ON u.referrer_id = ref.user_id
+               LEFT JOIN (
+                   SELECT referrer_id, SUM(amount) AS total_earned
+                   FROM referral_bonuses GROUP BY referrer_id
+               ) rb ON rb.referrer_id = ref.user_id
+               GROUP BY ref.user_id, ref.username, rb.total_earned
+               ORDER BY total_earned DESC NULLS LAST, referred_count DESC
+               LIMIT $1""",
+            limit,
+        )
+
+# ---------- Настройки заявок ----------
+
+async def get_order_settings():
+    """Настройки, влияющие на жизненный цикл заявок — сейчас только тайм-аут
+    авто-эскалации неподтверждённой заявки в спор."""
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("SELECT auto_dispute_timeout_minutes FROM order_settings WHERE id=1")
+        if row is None:
+            return {"auto_dispute_timeout_minutes": 60}
+        return {"auto_dispute_timeout_minutes": int(row["auto_dispute_timeout_minutes"])}
+
+async def set_auto_dispute_timeout_minutes(minutes):
+    minutes = int(minutes)
+    if minutes < 1:
+        raise ValueError("Тайм-аут должен быть не меньше 1 минуты")
+    async with pool.acquire() as conn:
+        await conn.execute("UPDATE order_settings SET auto_dispute_timeout_minutes=$1 WHERE id=1", minutes)
+
+# ---------- Администраторы ----------
+
+async def get_db_admin_ids():
+    """ID администраторов, назначенных через панель (без учёта тех, кто задан
+    переменной окружения ADMIN_ID — их список известен только вызывающей
+    стороне)."""
+    async with pool.acquire() as conn:
+        rows = await conn.fetch("SELECT user_id FROM admins")
+        return {int(r["user_id"]) for r in rows}
+
+async def list_admins_detailed():
+    async with pool.acquire() as conn:
+        return await conn.fetch("SELECT user_id, username, added_by, created_at FROM admins ORDER BY created_at")
+
+async def add_admin(user_id, username=None, added_by=None):
+    async with pool.acquire() as conn:
+        await conn.execute(
+            """INSERT INTO admins(user_id, username, added_by) VALUES($1,$2,$3)
+               ON CONFLICT (user_id) DO UPDATE SET username=EXCLUDED.username""",
+            user_id, username, added_by,
+        )
+
+async def remove_admin(user_id):
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow("DELETE FROM admins WHERE user_id=$1 RETURNING user_id", user_id)
+        return bool(row)
+
 # ---------- Депозиты (пополнение через xRocket) ----------
 
 async def create_deposit(user_id, invoice_id, amount):
@@ -1373,7 +1611,30 @@ async def mark_deposit_paid(invoice_id, paid_amount=None):
                 "INSERT INTO transactions(user_id,amount,type,description) VALUES($1,$2,'deposit',$3)",
                 row["user_id"], credit, f"Пополнение (счёт #{invoice_id})",
             )
-            return {"deposit_id": row["id"], "user_id": row["user_id"], "amount": credit}
+            # Реферальный бонус: разово, за самое первое успешно оплаченное
+            # пополнение приглашённого пользователя.
+            referral_bonus = None
+            referrer_id = await conn.fetchval("SELECT referrer_id FROM users WHERE user_id=$1", row["user_id"])
+            if referrer_id:
+                already_bonus = await conn.fetchval(
+                    "SELECT 1 FROM referral_bonuses WHERE referral_id=$1 AND kind='signup_deposit_bonus'",
+                    row["user_id"],
+                )
+                if not already_bonus:
+                    ref_settings = await conn.fetchrow("SELECT flat_bonus FROM referral_settings WHERE id=1")
+                    flat_bonus = float(ref_settings["flat_bonus"]) if ref_settings else 0.0
+                    if flat_bonus > 0:
+                        await conn.execute("UPDATE users SET balance=balance+$1 WHERE user_id=$2", flat_bonus, referrer_id)
+                        await conn.execute(
+                            "INSERT INTO transactions(user_id,amount,type,description) VALUES($1,$2,'referral_bonus',$3)",
+                            referrer_id, flat_bonus, f"Бонус за приглашённого пользователя {row['user_id']}",
+                        )
+                        await conn.execute(
+                            "INSERT INTO referral_bonuses(referrer_id,referral_id,amount,kind) VALUES($1,$2,$3,'signup_deposit_bonus')",
+                            referrer_id, row["user_id"], flat_bonus,
+                        )
+                        referral_bonus = {"referrer_id": referrer_id, "amount": flat_bonus}
+            return {"deposit_id": row["id"], "user_id": row["user_id"], "amount": credit, "referral_bonus": referral_bonus}
 
 async def mark_deposit_expired(invoice_id):
     invoice_id = str(invoice_id)
@@ -1427,6 +1688,47 @@ async def get_stats():
             "orders_by_status": {row["status"]: row["cnt"] for row in by_status},
             "active_services": services_count,
             "executors": executors_count,
+        }
+
+async def get_admin_analytics():
+    """Расширенная аналитика для админ-панели: выручка платформы (сумма
+    комиссии владельца) за 24ч/7д/30д/всего, динамика новых пользователей и
+    заявок за те же периоды, средний чек по завершённым заявкам и сумма
+    выплат по реферальной программе."""
+    async with pool.acquire() as conn:
+        revenue = await conn.fetchrow("""
+            SELECT
+              COALESCE(SUM(owner_commission_amount) FILTER (WHERE status='done' AND settled_at >= now() - interval '1 day'), 0) AS rev_1d,
+              COALESCE(SUM(owner_commission_amount) FILTER (WHERE status='done' AND settled_at >= now() - interval '7 day'), 0) AS rev_7d,
+              COALESCE(SUM(owner_commission_amount) FILTER (WHERE status='done' AND settled_at >= now() - interval '30 day'), 0) AS rev_30d,
+              COALESCE(SUM(owner_commission_amount) FILTER (WHERE status='done'), 0) AS rev_total
+            FROM orders
+        """)
+        users_periods = await conn.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE created_at >= now() - interval '1 day') AS new_1d,
+              COUNT(*) FILTER (WHERE created_at >= now() - interval '7 day') AS new_7d,
+              COUNT(*) FILTER (WHERE created_at >= now() - interval '30 day') AS new_30d
+            FROM users
+        """)
+        orders_periods = await conn.fetchrow("""
+            SELECT
+              COUNT(*) FILTER (WHERE created_at >= now() - interval '1 day') AS cnt_1d,
+              COUNT(*) FILTER (WHERE created_at >= now() - interval '7 day') AS cnt_7d,
+              COUNT(*) FILTER (WHERE created_at >= now() - interval '30 day') AS cnt_30d
+            FROM orders
+        """)
+        avg_check = await conn.fetchval("SELECT COALESCE(AVG(amount_rub),0) FROM orders WHERE status='done'")
+        referral_paid = await conn.fetchval("SELECT COALESCE(SUM(amount),0) FROM referral_bonuses")
+        return {
+            "rev_1d": float(revenue["rev_1d"]), "rev_7d": float(revenue["rev_7d"]),
+            "rev_30d": float(revenue["rev_30d"]), "rev_total": float(revenue["rev_total"]),
+            "new_users_1d": int(users_periods["new_1d"]), "new_users_7d": int(users_periods["new_7d"]),
+            "new_users_30d": int(users_periods["new_30d"]),
+            "orders_1d": int(orders_periods["cnt_1d"]), "orders_7d": int(orders_periods["cnt_7d"]),
+            "orders_30d": int(orders_periods["cnt_30d"]),
+            "avg_check_rub": float(avg_check or 0),
+            "referral_paid_total": float(referral_paid or 0),
         }
 
 # ---------- V10: chat read state / audit ----------

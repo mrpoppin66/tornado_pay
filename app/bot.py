@@ -1,6 +1,7 @@
 import os
 import json
 import re
+import asyncio
 from html import escape
 from typing import Any, Awaitable, Callable, Dict
 from aiogram import BaseMiddleware, Bot, Dispatcher, F
@@ -30,10 +31,12 @@ from .db import (
     create_deposit, get_deposit_by_invoice, mark_deposit_paid, mark_deposit_expired,
     submit_order_rating,
     is_payment_provider_enabled, get_payment_min_amount, PAYMENT_PROVIDER_LABELS,
+    auto_dispute_stale_orders, get_order_settings,
+    set_user_referrer, get_referral_settings, get_referral_stats, credit_referral_order_commission,
 )
 from . import xrocket
 from . import cryptobot
-from .admin import admin_router, ADMIN_IDS
+from .admin import admin_router, get_admin_ids
 from .profile_card import build_profile_card, get_avatar_bytes
 
 load_dotenv()
@@ -230,7 +233,7 @@ MENU_EMOJI_IDS = {
     "admin": None,
 }
 
-def menu(user_id=None, role=None):
+async def menu(user_id=None, role=None):
     executor_button = (
         InlineKeyboardButton(
             text="ЛК Исполнителя", callback_data="executor",
@@ -251,7 +254,7 @@ def menu(user_id=None, role=None):
     ]
     kb.append([InlineKeyboardButton(text="Уведомления", callback_data="notifications",
                                      icon_custom_emoji_id=MENU_EMOJI_IDS["notifications"])])
-    if user_id in ADMIN_IDS:
+    if user_id in await get_admin_ids():
         kb.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="adm:menu",
                                          icon_custom_emoji_id=MENU_EMOJI_IDS["admin"])])
     return InlineKeyboardMarkup(inline_keyboard=kb)
@@ -279,6 +282,20 @@ def chat_kb(order_id):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="❌ Закрыть чат", callback_data=f"chat:close:{order_id}")]
     ])
+
+async def _notify_referral_bonus(bot: Bot, referral_bonus, context_note=""):
+    """Уведомляет реферера о начислении реферального вознаграждения.
+    referral_bonus — dict {"referrer_id":..., "amount":...} или None."""
+    if not referral_bonus:
+        return
+    try:
+        await bot.send_message(
+            referral_bonus["referrer_id"],
+            f"🤝 <b>Реферальное вознаграждение</b>\n\nНачислено <b>{referral_bonus['amount']:.4f} USDT</b>{context_note}.",
+            parse_mode="HTML",
+        )
+    except Exception as e:
+        print(f"[referral notify] {e}")
 
 async def notify_available_executors_new_order(bot: Bot, order_id: int, service_name: str,
                                                 amount_rub: float, payout_usdt: float,
@@ -374,7 +391,20 @@ async def order_chat_message(m: Message, state: FSMContext):
 
 @dp.message(CommandStart())
 async def start(m: Message):
+    is_new_user = (await get_user(m.from_user.id)) is None
     await ensure_user(m.from_user.id, m.from_user.username)
+
+    if is_new_user:
+        payload = ""
+        if m.text and " " in m.text:
+            payload = m.text.split(" ", 1)[1].strip()
+        if payload.startswith("ref_"):
+            ref_part = payload[4:]
+            if ref_part.isdigit():
+                try:
+                    await set_user_referrer(m.from_user.id, int(ref_part))
+                except Exception as e:
+                    print(f"[referral attach] {e}")
 
     if not await get_user_agreement_accepted(m.from_user.id):
         await m.answer(
@@ -397,7 +427,7 @@ async def start(m: Message):
         f"Выберите услугу и укажите сумму в рублях.\n\n"
         f"📊 Текущий курс: 1 USDT = {rate:.2f} RUB"
     )
-    kb = menu(m.from_user.id, user[3] if user else None)
+    kb = await menu(m.from_user.id, user[3] if user else None)
     try:
         await m.answer_photo(FSInputFile(START_BANNER_PATH), caption=caption, reply_markup=kb, parse_mode="HTML")
     except Exception as e:
@@ -429,7 +459,7 @@ async def agree_tos(c: CallbackQuery):
         f"Выберите услугу и укажите сумму в рублях.\n\n"
         f"📊 Текущий курс: 1 USDT = {rate:.2f} RUB"
     )
-    kb = menu(c.from_user.id, user[3] if user else None)
+    kb = await menu(c.from_user.id, user[3] if user else None)
     try:
         await c.message.delete()
     except Exception:
@@ -456,7 +486,7 @@ async def check_subscription_cb(c: CallbackQuery):
         f"Выберите услугу и укажите сумму в рублях.\n\n"
         f"📊 Текущий курс: 1 USDT = {rate:.2f} RUB"
     )
-    kb = menu(c.from_user.id, user[3] if user else None)
+    kb = await menu(c.from_user.id, user[3] if user else None)
     try:
         await c.message.delete()
     except Exception:
@@ -490,6 +520,7 @@ async def profile(c: CallbackQuery):
         [InlineKeyboardButton(text="💰 Баланс", callback_data="balance")],
         [InlineKeyboardButton(text="📊 История операций", callback_data="profile:transactions")],
         [InlineKeyboardButton(text="💳 Пополнить", callback_data="profile:deposit")],
+        [InlineKeyboardButton(text="🤝 Рефералы", callback_data="profile:referrals")],
     ]
     kb_rows.append([InlineKeyboardButton(text="⬅️ Главное меню", callback_data="back")])
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
@@ -514,6 +545,26 @@ async def profile(c: CallbackQuery):
             f"ID: <code>{u[0]}</code>\n"
             f"Роль: <b>{role_label}</b>",
             reply_markup=kb, parse_mode="HTML")
+    await c.answer()
+
+@dp.callback_query(F.data == "profile:referrals")
+async def profile_referrals(c: CallbackQuery):
+    me = await c.bot.get_me()
+    link = f"https://t.me/{me.username}?start=ref_{c.from_user.id}"
+    settings = await get_referral_settings()
+    stats = await get_referral_stats(c.from_user.id)
+    text = (
+        "🤝 <b>Реферальная программа</b>\n\n"
+        f"Приглашайте пользователей по своей ссылке и получайте:\n"
+        f"• <b>{settings['percent']:.2f}%</b> от комиссии платформы за каждую завершённую заявку реферала\n"
+        f"• <b>{settings['flat_bonus']:.2f} USDT</b> разово за первое пополнение реферала\n\n"
+        f"Ваша ссылка:\n<code>{link}</code>\n\n"
+        f"Приглашено пользователей: <b>{stats['count']}</b>\n"
+        f"Заработано на программе: <b>{stats['total_earned']:.4f} USDT</b>"
+    )
+    await safe_edit(c, text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ Личный кабинет", callback_data="profile")]
+    ]), parse_mode="HTML")
     await c.answer()
 
 @dp.callback_query(F.data == "profile:transactions")
@@ -616,6 +667,7 @@ async def profile_deposit_check(c: CallbackQuery):
         result=await mark_deposit_paid(key, amount)
         if result:
             u=await get_user(c.from_user.id); await safe_edit(c, f"✅ Баланс пополнен на <b>{result['amount']:.4f} USDT</b>.\n\nТекущий баланс: <b>{float(u[2]):.4f} USDT</b>", reply_markup=back(), parse_mode="HTML")
+            await _notify_referral_bonus(c.bot, result.get("referral_bonus"), " за первое пополнение вашего реферала")
         else: await c.answer("Этот счёт уже был зачислен ранее.", show_alert=True)
         return
     if status in ("expired","expired_paid"):
@@ -1431,6 +1483,8 @@ async def client_confirm_order(c: CallbackQuery):
     try:
         await c.bot.send_message(executor_id, f"🎉 <b>Заявка #{order_id} подтверждена клиентом.</b>\n\nСредства за заявку зачислены на ваш баланс.", parse_mode="HTML")
     except Exception as e: print(f"[Notify confirm] {e}")
+    referral_result = await credit_referral_order_commission(order_id)
+    await _notify_referral_bonus(c.bot, referral_result, f" за заявку вашего реферала #{order_id}")
     await c.message.edit_text(
         f"✅ <b>Заявка #{order_id} завершена.</b>\n\nВыполнение подтверждено.\n\n"
         "⭐ Оцените работу исполнителя от 1 до 5 звёзд:",
@@ -1481,7 +1535,7 @@ async def client_dispute_order(c: CallbackQuery):
     try:
         await c.bot.send_message(executor_id, f"⚠️ <b>По заявке #{order_id} открыт спор.</b>\n\nСредства остаются в резерве до решения администрации.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Открыть чат",callback_data=f"chat:open:{order_id}")]]), parse_mode="HTML")
     except Exception as e: print(f"[Notify dispute executor] {e}")
-    for admin_id in ADMIN_IDS:
+    for admin_id in await get_admin_ids():
         try:
             await c.bot.send_message(admin_id, f"⚠️ <b>Открыт спор по заявке #{order_id}</b>\n\nКлиент: <code>{c.from_user.id}</code>\nИсполнитель: <code>{executor_id}</code>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚖️ Открыть спор",callback_data=f"adm:dispute:{order_id}")]]), parse_mode="HTML")
         except Exception as e: print(f"[Dispute admin notify] {e}")
@@ -1852,7 +1906,7 @@ async def go_back(c: CallbackQuery, state: FSMContext):
         f"Выберите раздел:\n\n"
         f"📊 Курс: 1 USDT = {rate:.2f} RUB"
     )
-    kb = menu(c.from_user.id, u[3] if u else None)
+    kb = await menu(c.from_user.id, u[3] if u else None)
     # Главное меню всегда должно быть фото-сообщением с баннером, поэтому
     # старое сообщение (текстовое или фото) удаляется и отправляется новое
     # фото-сообщение — так же, как это делает /start.
@@ -1946,8 +2000,82 @@ async def _xrocket_webhook_handler(request):
                         )
                     except Exception as e:
                         print(f"[xrocket webhook notify] {e}")
+                    await _notify_referral_bonus(bot_instance, result.get("referral_bonus"), " за первое пополнение вашего реферала")
 
     return web.Response(status=200, text="ok")
+
+
+# --- Автоматическая эскалация заявок в спор ---
+# Если исполнитель отметил заявку выполненной, а клиент не подтвердил и не
+# открыл спор сам в течение настраиваемого тайм-аута (по умолчанию 60 минут,
+# редактируется в админ-панели — см. get_order_settings) — заявка
+# автоматически уходит в статус «спор», чтобы решение принял администратор.
+AUTO_DISPUTE_CHECK_INTERVAL_SECONDS = 60
+
+async def auto_dispute_loop(bot: Bot):
+    """Фоновая задача: раз в AUTO_DISPUTE_CHECK_INTERVAL_SECONDS проверяет
+    заявки, зависшие в 'awaiting_confirmation' дольше настроенного тайм-аута,
+    и переводит их в 'disputed' с уведомлением клиента, исполнителя и
+    администраторов."""
+    while True:
+        try:
+            order_settings = await get_order_settings()
+            timeout_minutes = order_settings["auto_dispute_timeout_minutes"]
+            stale = await auto_dispute_stale_orders(timeout_minutes)
+            for item in stale:
+                order_id = item["order_id"]
+                client_id = item["client_id"]
+                executor_id = item["executor_id"]
+                await log_order_event(
+                    order_id, None, "auto_dispute",
+                    f"Автоматически переведено в спор: клиент не подтвердил заявку в течение {timeout_minutes} минут",
+                )
+                await create_notification(
+                    client_id, "dispute", f"⚖️ Спор по заявке #{order_id}",
+                    "Время на подтверждение истекло — заявка передана администратору.", order_id,
+                )
+                if executor_id:
+                    await create_notification(
+                        executor_id, "dispute", f"⚖️ Спор по заявке #{order_id}",
+                        "Клиент не подтвердил заявку вовремя — она передана в спор.", order_id,
+                    )
+                try:
+                    await bot.send_message(
+                        client_id,
+                        f"⚖️ <b>Заявка #{order_id} автоматически передана в спор.</b>\n\n"
+                        f"Вы не подтвердили выполнение в течение {timeout_minutes} минут. "
+                        "Администрация рассмотрит ситуацию.",
+                        parse_mode="HTML",
+                    )
+                except Exception as e:
+                    print(f"[auto dispute notify client] {e}")
+                if executor_id:
+                    try:
+                        await bot.send_message(
+                            executor_id,
+                            f"⚖️ <b>По заявке #{order_id} автоматически открыт спор.</b>\n\n"
+                            "Клиент не подтвердил выполнение вовремя. Средства остаются в резерве до решения администрации.",
+                            parse_mode="HTML",
+                        )
+                    except Exception as e:
+                        print(f"[auto dispute notify executor] {e}")
+                for admin_id in await get_admin_ids():
+                    try:
+                        await bot.send_message(
+                            admin_id,
+                            f"⚖️ <b>Автоматический спор по заявке #{order_id}</b>\n\n"
+                            f"Клиент не подтвердил заявку в течение {timeout_minutes} минут.\n\n"
+                            f"Клиент: <code>{client_id}</code>\nИсполнитель: <code>{executor_id or '—'}</code>",
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                [InlineKeyboardButton(text="⚖️ Открыть спор", callback_data=f"adm:dispute:{order_id}")]
+                            ]),
+                            parse_mode="HTML",
+                        )
+                    except Exception as e:
+                        print(f"[auto dispute admin notify] {e}")
+        except Exception as e:
+            print(f"[auto dispute loop] {e}")
+        await asyncio.sleep(AUTO_DISPUTE_CHECK_INTERVAL_SECONDS)
 
 
 async def start_xrocket_webhook_server(bot_instance: Bot):
@@ -1975,11 +2103,12 @@ async def start_xrocket_webhook_server(bot_instance: Bot):
 async def main():
     await init_db()
 
-    # Запускаем фоновое обновление курса
-    import asyncio
-    asyncio.create_task(start_exchange_rate_updater())
-
     bot = Bot(TOKEN)
+
+    # Фоновые задачи: обновление курса и авто-эскалация зависших заявок в спор
+    asyncio.create_task(start_exchange_rate_updater())
+    asyncio.create_task(auto_dispute_loop(bot))
+
     # Кнопка-меню команд слева от поля ввода (рядом со скрепкой) — берётся
     # из этого списка. Без него в интерфейсе Telegram она не показывается.
     await bot.set_my_commands([
