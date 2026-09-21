@@ -17,9 +17,9 @@
   // Telegram (шапку/системный фон вокруг WebView) покрасить в тон приложения.
   function applyBrandChrome() {
     if (!tg) return;
-    try { tg.setHeaderColor && tg.setHeaderColor("#060b09"); } catch (e) {}
-    try { tg.setBackgroundColor && tg.setBackgroundColor("#050a08"); } catch (e) {}
-    try { tg.setBottomBarColor && tg.setBottomBarColor("#060b09"); } catch (e) {}
+    try { tg.setHeaderColor && tg.setHeaderColor("#020907"); } catch (e) {}
+    try { tg.setBackgroundColor && tg.setBackgroundColor("#020907"); } catch (e) {}
+    try { tg.setBottomBarColor && tg.setBottomBarColor("#030f0c"); } catch (e) {}
   }
   applyBrandChrome();
 
@@ -79,7 +79,7 @@
     el.textContent = msg;
     el.style.cssText =
       "position:fixed;left:50%;bottom:84px;transform:translateX(-50%);z-index:999;" +
-      "background:" + (isError ? "#df3f40" : "#2fa84f") + ";color:#fff;padding:10px 16px;" +
+      "background:" + (isError ? "#c94155" : "#18c992") + ";color:#03120d;padding:10px 16px;" +
       "border-radius:12px;font-size:14px;max-width:86%;text-align:center;box-shadow:0 4px 14px rgba(0,0,0,.2);";
     document.body.appendChild(el);
     setTimeout(function () { el.remove(); }, 3000);
@@ -201,8 +201,12 @@
   });
 
   function tile(icon, title, sub, href) {
+    var iconMap = {
+      "🛍": "↗", "📋": "≡", "🧑‍💼": "◌", "🤝": "◇"
+    };
+    var visualIcon = iconMap[icon] || icon;
     return '<div class="tile" onclick="location.hash=\'' + href + '\'">' +
-      '<span class="tile-icon">' + icon + "</span>" +
+      '<span class="tile-icon" aria-hidden="true">' + visualIcon + "</span>" +
       '<div class="tile-title">' + esc(title) + "</div>" +
       (sub ? '<div class="tile-sub">' + esc(sub) + "</div>" : "") +
       "</div>";
