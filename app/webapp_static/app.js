@@ -111,7 +111,9 @@
     } catch (e) {}
   }
   function openExternal(url) {
-    if (tg && tg.openLink) tg.openLink(url, { try_instant_view: false });
+    var isTelegramLink = /^https?:\/\/t\.me\//i.test(url || "");
+    if (tg && isTelegramLink && tg.openTelegramLink) tg.openTelegramLink(url);
+    else if (tg && tg.openLink) tg.openLink(url, { try_instant_view: false });
     else window.open(url, "_blank");
   }
   function toast(msg, isError) {
