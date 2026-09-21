@@ -68,11 +68,15 @@ async def create_invoice(amount, description="", payload=""):
         "priceCurrency": DEPOSIT_CURRENCY,
         "description": description[:1000],
         "clientInvoiceId": f"tp-{uuid.uuid4().hex}",
-        "expiresIn": DEPOSIT_EXPIRE_SECONDS,
+        # xRocket Pay API expects "expiredIn" (not "expiresIn"); the wrong
+        # key name was silently ignored by the API, which fell back to its
+        # own (very short) default and made every invoice expire instantly.
+        "expiredIn": DEPOSIT_EXPIRE_SECONDS,
     }
     if payload:
         body["callback"] = {"payload": {"userId": str(payload)}}
     data = await _request("POST", "/api/v1/invoices", json=body)
+    print(f"[xrocket create_invoice] expiredIn sent={DEPOSIT_EXPIRE_SECONDS}s, raw response={data}")
     return _normalize_invoice(data)
 
 async def get_invoice(invoice_id):
