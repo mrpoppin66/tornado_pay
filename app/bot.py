@@ -8,7 +8,7 @@ from aiogram import BaseMiddleware, Bot, Dispatcher, F
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, BufferedInputFile, TelegramObject, BotCommand
+from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton, FSInputFile, BufferedInputFile, TelegramObject, BotCommand, MenuButtonWebApp, WebAppInfo
 from aiohttp import web
 from dotenv import load_dotenv
 from .db import (
@@ -21,6 +21,7 @@ from .db import (
     EXECUTOR_APPLICATION_STATUSES, get_free_orders, claim_order, complete_executor_order,
     confirm_order_by_client, dispute_order_by_client,
     get_order_chat_peer, save_order_chat_message, get_executor_active_order, get_executor_history,
+    get_order,
     set_executor_card_details, get_executor_card_details, set_executor_card_reference, get_executor_card_reference,
     create_withdrawal_request, set_withdrawal_provider, set_withdrawal_provider_status, mark_withdrawal_error, approve_withdrawal, get_withdrawal_by_provider_id, get_user_transactions, get_chat_unread_count, get_chat_unread_for_orders,
     mark_chat_read, get_recent_chat_messages, get_executor_detailed_stats,
@@ -38,9 +39,11 @@ from . import xrocket
 from . import cryptobot
 from .admin import admin_router, get_admin_ids
 from .profile_card import build_profile_card, get_avatar_bytes
+from .webapp_api import setup_webapp_routes
 
 load_dotenv()
 TOKEN = os.getenv("BOT_TOKEN")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").rstrip("/")
 if not TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
 
@@ -254,6 +257,8 @@ async def menu(user_id=None, role=None):
     ]
     kb.append([InlineKeyboardButton(text="Уведомления", callback_data="notifications",
                                      icon_custom_emoji_id=MENU_EMOJI_IDS["notifications"])])
+    if PUBLIC_BASE_URL:
+        kb.append([InlineKeyboardButton(text="📱 Открыть в приложении", web_app=WebAppInfo(url=f"{PUBLIC_BASE_URL}/webapp/"))])
     if user_id in await get_admin_ids():
         kb.append([InlineKeyboardButton(text="🛠 Админ-панель", callback_data="adm:menu",
                                          icon_custom_emoji_id=MENU_EMOJI_IDS["admin"])])
@@ -2078,25 +2083,37 @@ async def auto_dispute_loop(bot: Bot):
         await asyncio.sleep(AUTO_DISPUTE_CHECK_INTERVAL_SECONDS)
 
 
-async def start_xrocket_webhook_server(bot_instance: Bot):
-    """Поднимает отдельный HTTP-сервер для приёма вебхуков xRocket Pay,
-    параллельно с long polling бота. Если XROCKET_API_TOKEN не задан —
-    сервер не запускается (интеграция просто выключена)."""
-    if not xrocket.is_configured():
-        print("[xrocket] XROCKET_API_TOKEN не задан — сервер вебхуков не запущен.")
-        return None
+async def start_web_server(bot_instance: Bot):
+    """Поднимает единый HTTP-сервер для этого бота: Mini App (статика + API)
+    всегда, плюс приём вебхуков xRocket Pay, если XROCKET_API_TOKEN задан.
+    Всё крутится на одном порту, чтобы на Railway/Render хватало одного
+    внешнего HTTPS-адреса и одной проброшенной переменной PORT."""
     app = web.Application()
     app["bot"] = bot_instance
-    path = os.getenv("XROCKET_WEBHOOK_PATH", "/webhooks/xrocket")
-    app.router.add_post(path, _xrocket_webhook_handler)
+    try:
+        me = await bot_instance.get_me()
+        app["bot_username"] = me.username
+    except Exception as e:
+        print(f"[webapp] Не удалось получить username бота: {e}")
+        app["bot_username"] = None
+
+    static_dir = os.path.join(os.path.dirname(__file__), "webapp_static")
+    setup_webapp_routes(app, TOKEN, static_dir)
+
+    if xrocket.is_configured():
+        path = os.getenv("XROCKET_WEBHOOK_PATH", "/webhooks/xrocket")
+        app.router.add_post(path, _xrocket_webhook_handler)
+    else:
+        print("[xrocket] XROCKET_API_TOKEN не задан — вебхук xRocket не зарегистрирован (Mini App при этом всё равно работает).")
+
     runner = web.AppRunner(app)
     await runner.setup()
-    host = os.getenv("XROCKET_WEBHOOK_HOST", "0.0.0.0")
-    port = int(os.getenv("XROCKET_WEBHOOK_PORT", "8085"))
+    host = os.getenv("HOST", os.getenv("XROCKET_WEBHOOK_HOST", "0.0.0.0"))
+    port = int(os.getenv("PORT", os.getenv("XROCKET_WEBHOOK_PORT", "8085")))
     site = web.TCPSite(runner, host, port)
     await site.start()
-    print(f"[xrocket] Webhook слушает на http://{host}:{port}{path} "
-          f"(этот путь нужно опубликовать наружу по HTTPS и указать в настройках приложения в @xRocket)")
+    print(f"[web] Сервер слушает на http://{host}:{port} — Mini App на /webapp/, API на /api/"
+          + (f", вебхук xRocket на {os.getenv('XROCKET_WEBHOOK_PATH', '/webhooks/xrocket')}" if xrocket.is_configured() else ""))
     return runner
 
 
@@ -2114,7 +2131,19 @@ async def main():
     await bot.set_my_commands([
         BotCommand(command="start", description="Открыть главное меню"),
     ])
-    webhook_runner = await start_xrocket_webhook_server(bot)
+
+    # Персистентная кнопка меню (рядом со скрепкой) открывает Mini App в один тап.
+    if PUBLIC_BASE_URL:
+        try:
+            await bot.set_chat_menu_button(
+                menu_button=MenuButtonWebApp(text="Открыть", web_app=WebAppInfo(url=f"{PUBLIC_BASE_URL}/webapp/"))
+            )
+        except Exception as e:
+            print(f"[webapp] Не удалось установить кнопку меню Mini App: {e}")
+    else:
+        print("[webapp] PUBLIC_BASE_URL не задан — кнопка меню Mini App не установлена (сам Mini App при этом всё равно доступен по прямой ссылке).")
+
+    webhook_runner = await start_web_server(bot)
     try:
         await dp.start_polling(bot)
     finally:

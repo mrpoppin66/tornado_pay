@@ -1782,6 +1782,15 @@ async def get_recent_chat_messages(order_id, limit=12):
             FROM order_chat_messages WHERE order_id=$1 ORDER BY id DESC LIMIT $2
         """, order_id, limit)
 
+async def get_order_chat_messages_after(order_id, after_id=0, limit=100):
+    """Сообщения чата по заявке с id больше after_id, в хронологическом
+    порядке — используется мини-приложением для поллинга новых сообщений."""
+    async with pool.acquire() as conn:
+        return await conn.fetch("""
+            SELECT id,sender_id,content_type,text_content,created_at
+            FROM order_chat_messages WHERE order_id=$1 AND id > $2 ORDER BY id ASC LIMIT $3
+        """, order_id, after_id, limit)
+
 async def get_order_counts_by_status():
     async with pool.acquire() as conn:
         rows = await conn.fetch("SELECT status, COUNT(*) cnt FROM orders GROUP BY status")

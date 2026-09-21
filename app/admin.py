@@ -28,6 +28,7 @@ from .db import (
     approve_executor_application, reject_executor_application, block_executor, unblock_executor,
     EXECUTOR_APPLICATION_STATUSES,
     settle_order_executor, refund_order_client, get_pending_withdrawals, get_admin_withdrawals, approve_withdrawal, reject_withdrawal, force_refund_withdrawal, force_mark_withdrawal_paid, get_withdrawal, get_disputed_orders, get_recent_chat_messages,
+    set_withdrawal_provider, mark_withdrawal_error,
     get_order_events, get_order_evidence, list_executors_admin, set_user_blocked_only, get_all_services_stats, set_service_max_amount, get_service_limits, get_user_blocked, get_user_block_info,
     log_order_event, create_notification, get_service,
     get_payment_settings, set_payment_provider_enabled, set_payment_min_amount,
