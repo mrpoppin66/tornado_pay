@@ -408,3 +408,83 @@ label { font-size: 13px; color: var(--hint); display: block; margin: 8px 0 4px; 
   .tile .tile-icon { width:44px; height:44px; }
   .tile .tile-title { font-size:11px; }
 }
+
+/* ---------- TornadoPay Home v3 ---------- */
+.brand-logo {
+  width: 38px;
+  height: 38px;
+  flex: 0 0 38px;
+  object-fit: cover;
+  border-radius: 11px;
+  box-shadow: 0 0 18px rgba(47,230,168,.22);
+}
+#topbar-title { -webkit-text-fill-color: initial; color: var(--text); }
+#topbar-title > span { font-weight: 750; }
+
+.welcome-row {
+  display:flex;
+  align-items:center;
+  justify-content:space-between;
+  gap:12px;
+  margin: 4px 0 13px;
+}
+.welcome-row h1 { margin: 2px 0 0; font-size: 23px; letter-spacing:-.35px; }
+.eyebrow, .section-kicker {
+  font-size: 9px;
+  letter-spacing: 1.5px;
+  color:#4edfb4;
+  font-weight:800;
+}
+.welcome-glow {
+  width:38px;height:38px;border-radius:13px;display:grid;place-items:center;
+  color:#7cf8d3;background:rgba(47,230,168,.07);border:1px solid rgba(83,245,201,.15);
+  box-shadow:0 0 22px rgba(47,230,168,.08);
+}
+.welcome-glow svg { width:19px;height:19px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round; }
+
+.balance-hero { padding:17px; margin-bottom:15px; }
+.balance-top { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+.balance-hero .value span { font-size:13px; letter-spacing:.6px; opacity:.7; }
+.balance-symbol {
+  width:50px;height:50px;flex:0 0 50px;display:grid;place-items:center;border-radius:16px;
+  color:#69f3c9;background:rgba(47,230,168,.09);border:1px solid rgba(83,245,201,.18);
+}
+.balance-symbol svg { width:25px;height:25px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round; }
+.balance-actions { display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:13px; }
+.balance-actions button { margin-top:0; padding:10px 12px; font-size:13px; }
+.balance-actions .btn-icon { width:16px;height:16px;display:inline-grid;place-items:center; }
+.balance-actions .btn-icon svg { width:16px;height:16px;fill:none;stroke:currentColor;stroke-width:1.8;stroke-linecap:round;stroke-linejoin:round; }
+
+.home-section-head { display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin:16px 0 9px; }
+.home-section-head h2 { margin:2px 0 0; font-size:17px; }
+.home-section-head a { display:flex;align-items:center;gap:3px;color:#72f6cf;text-decoration:none;font-size:12px;font-weight:700;white-space:nowrap; }
+.home-section-head a svg { width:14px;height:14px;fill:none;stroke:currentColor;stroke-width:2;stroke-linecap:round;stroke-linejoin:round; }
+
+.tile-grid { margin-bottom: 2px; }
+.tile .tile-title { min-height: 28px; }
+
+.home-services { display:flex;flex-direction:column;gap:7px; }
+.home-service {
+  display:flex;align-items:center;gap:11px;min-height:67px;padding:10px 11px;
+  border:1px solid rgba(83,245,201,.14);border-radius:15px;
+  background:linear-gradient(145deg,rgba(13,35,29,.9),rgba(6,20,16,.97));
+  box-shadow:inset 0 1px 0 rgba(255,255,255,.035);
+  cursor:pointer;
+}
+.home-service:active { transform:scale(.992); border-color:rgba(83,245,201,.32); }
+.home-service .service-icon.compact { width:42px;height:42px;flex-basis:42px;border-radius:13px; }
+.home-service .service-icon.compact svg { width:22px;height:22px; }
+.home-service .service-main { display:flex;flex-direction:column;gap:2px; }
+.home-service .service-title { font-size:14px; }
+.home-service .muted { white-space:nowrap;overflow:hidden;text-overflow:ellipsis;font-size:11px; }
+.home-service .service-arrow { margin-left:auto; }
+.home-promo { display:flex;align-items:center;gap:11px;margin-top:12px;padding:12px 13px; }
+.promo-icon { width:38px;height:38px;flex:0 0 38px;display:grid;place-items:center;border-radius:12px;color:#72f6cf;background:rgba(47,230,168,.08);border:1px solid rgba(83,245,201,.15); }
+.promo-icon svg { width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.7;stroke-linecap:round;stroke-linejoin:round; }
+.home-promo strong { display:block;font-size:13px;margin-bottom:2px; }
+
+@media (max-width:420px) {
+  .welcome-row h1 { font-size:21px; }
+  .balance-hero .value { font-size:27px; }
+  .balance-symbol { width:44px;height:44px;flex-basis:44px; }
+}

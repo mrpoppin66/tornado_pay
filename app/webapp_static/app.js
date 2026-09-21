@@ -78,13 +78,16 @@
   function svgIcon(name, cls) {
     return '<svg class="' + (cls || '') + '" viewBox="0 0 24 24" aria-hidden="true">' + (ICONS[name] || ICONS.generic) + '</svg>';
   }
+  function cleanServiceName(name) {
+    return String(name || '').replace(/^[\s\u200b]*(?:[📱💳📲🧾💰🪙🔹🔸])\s*/u, '').trim();
+  }
   function serviceIcon(name) {
-    var n = String(name || '').toLowerCase();
-    if (n.indexOf('telegram') !== -1) return 'telegram';
-    if (n.indexOf('youtube') !== -1) return 'youtube';
-    if (n.indexOf('tiktok') !== -1) return 'tiktok';
-    if (n.indexOf('вконт') !== -1 || n.indexOf('vk') !== -1) return 'vk';
-    if (n.indexOf('instagram') !== -1) return 'instagram';
+    var n = cleanServiceName(name).toLowerCase();
+    if (n.indexOf('мобиль') !== -1) return 'mobile';
+    if (n.indexOf('qr') !== -1 || n.indexOf('qr-код') !== -1) return 'qr';
+    if (n.indexOf('сбп') !== -1) return 'sbp';
+    if (n.indexOf('карта под оплату') !== -1) return 'executor_card';
+    if (n.indexOf('на карту') !== -1 || n === 'карта') return 'card';
     if (n.indexOf('рефера') !== -1) return 'referrals';
     if (n.indexOf('баланс') !== -1 || n.indexOf('вывод') !== -1) return 'wallet';
     return 'spark';
@@ -226,18 +229,38 @@
   // ---------- Экран: главная ----------
   route(/^\/home$/, function (root) {
     var roleLine = ME.role === "executor"
-      ? (ME.executor_blocked ? "🚫 Исполнитель (заблокирован)" : "🧑‍💼 Исполнитель")
-      : "👤 Клиент";
+      ? (ME.executor_blocked ? "Исполнитель заблокирован" : "Исполнитель")
+      : "Клиент";
     root.innerHTML =
-      '<h1>Привет' + (ME.username ? ", @" + esc(ME.username) : "") + '!</h1>' +
-      '<div class="balance-hero"><div class="label">' + roleLine + ' · Баланс</div>' +
-      '<div class="value">' + fmt(ME.balance, 4) + ' USDT</div></div>' +
+      '<div class="welcome-row"><div><div class="eyebrow">TORNADOPAY</div><h1>Привет' + (ME.username ? ", @" + esc(ME.username) : "") + '!</h1></div><div class="welcome-glow">' + svgIcon('spark') + '</div></div>' +
+      '<div class="balance-hero">' +
+        '<div class="balance-top"><div><div class="label">' + roleLine + ' · Ваш баланс</div><div class="value">' + fmt(ME.balance, 4) + ' <span>USDT</span></div></div><span class="balance-symbol">' + svgIcon('wallet') + '</span></div>' +
+        '<div class="balance-actions"><button class="secondary" onclick="location.hash=&quot;#/balance&quot;"><span class="btn-icon">' + svgIcon('plus') + '</span>Пополнить</button><button onclick="location.hash=&quot;#/balance&quot;"><span class="btn-icon">' + svgIcon('arrow') + '</span>Вывести</button></div>' +
+      '</div>' +
+      '<div class="home-section-head"><div><div class="section-kicker">БЫСТРЫЙ ДОСТУП</div><h2>Что вам нужно?</h2></div></div>' +
       '<div class="tile-grid">' +
-      tile("services", "Услуги", "Создать заявку", "#/services") +
-      tile("orders", "Мои заявки", "Статусы и чат", "#/orders") +
-      tile("executor", ME.role === "executor" ? "Кабинет исполнителя" : "Стать исполнителем", "", "#/executor") +
+      tile("services", "Услуги", "Переводы и оплата", "#/services") +
+      tile("orders", "Мои заявки", "История и статусы", "#/orders") +
+      tile("executor", ME.role === "executor" ? "Кабинет" : "Стать исполнителем", ME.role === "executor" ? "Управление работой" : "Получать заявки", "#/executor") +
       tile("referrals", "Рефералы", "Приглашайте друзей", "#/referrals") +
-      "</div>";
+      "</div>" +
+      '<div class="home-section-head services-head"><div><div class="section-kicker">ОСНОВНЫЕ УСЛУГИ</div><h2>Популярные операции</h2></div><a href="#/services">Все услуги <span>' + svgIcon('arrow') + '</span></a></div>' +
+      '<div id="home-services" class="home-services"><div class="spinner"></div></div>' +
+      '<div class="home-promo card"><div class="promo-icon">' + svgIcon('shield') + '</div><div><strong>Безопасные операции</strong><div class="muted">Заявки, баланс и история — в одном месте.</div></div></div>';
+
+    return apiGet("/services").then(function (services) {
+      var box = document.getElementById("home-services");
+      if (!box) return;
+      box.innerHTML = services.slice(0, 5).map(function (s) {
+        return '<div class="home-service" data-id="' + s.id + '">' +
+          '<span class="service-icon compact">' + svgIcon(serviceIcon(s.name)) + '</span>' +
+          '<span class="service-main"><span class="service-title">' + esc(cleanServiceName(s.name)) + '</span><span class="muted">' + esc(s.description || '') + '</span></span>' +
+          '<span class="service-arrow">' + svgIcon('arrow') + '</span></div>';
+      }).join('');
+      box.querySelectorAll('[data-id]').forEach(function (el) {
+        el.onclick = function () { location.hash = '#/order-new/' + el.getAttribute('data-id'); };
+      });
+    });
   });
 
   function tile(icon, title, sub, href) {
@@ -289,7 +312,7 @@
         return '<div class="card tappable service-card" data-id="' + s.id + '">' +
           '<div class="service-icon">' + svgIcon(serviceIcon(s.name)) + '</div>' +
           '<div class="service-main">' +
-          '<div class="service-title">' + esc(s.name) + "</div>" +
+          '<div class="service-title">' + esc(cleanServiceName(s.name)) + "</div>" +
           (s.description ? '<div class="muted" style="margin-top:4px">' + esc(s.description) + "</div>" : "") +
           '<div class="muted" style="margin-top:5px">От ' + fmt(minRub, 0) + " ₽</div>" +
           '</div><div class="service-arrow">' + svgIcon('arrow') + '</div>' +
