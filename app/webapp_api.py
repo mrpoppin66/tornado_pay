@@ -771,8 +771,36 @@ def setup_webapp_routes(app: web.Application, bot_token: str, static_dir: str):
     app.router.add_get("/api/notifications", api_notifications)
     app.router.add_post("/api/notifications/read", api_notifications_read)
 
+    _index_html_cache = {"mtime": None, "text": None}
+
+    def _versioned_index_html():
+        """Подставляет в index.html версию по времени изменения app.js/style.css,
+        чтобы после деплоя мобильные клиенты Telegram (агрессивно кэширующие
+        WebView) гарантированно подтягивали новые статические файлы, а не
+        старую закэшированную версию мини-аппа."""
+        js_path = os.path.join(static_dir, "app.js")
+        css_path = os.path.join(static_dir, "style.css")
+        html_path = os.path.join(static_dir, "index.html")
+        version = int(max(
+            os.path.getmtime(js_path) if os.path.exists(js_path) else 0,
+            os.path.getmtime(css_path) if os.path.exists(css_path) else 0,
+        ))
+        html_mtime = os.path.getmtime(html_path) if os.path.exists(html_path) else 0
+        cache_key = (version, html_mtime)
+        if _index_html_cache["mtime"] != cache_key:
+            with open(html_path, "r", encoding="utf-8") as f:
+                text = f.read()
+            text = text.replace('href="style.css"', f'href="style.css?v={version}"')
+            text = text.replace('src="app.js"', f'src="app.js?v={version}"')
+            _index_html_cache["mtime"] = cache_key
+            _index_html_cache["text"] = text
+        return _index_html_cache["text"]
+
     async def index(request):
-        return web.FileResponse(os.path.join(static_dir, "index.html"))
+        return web.Response(
+            text=_versioned_index_html(), content_type="text/html",
+            headers={"Cache-Control": "no-cache, no-store, must-revalidate"},
+        )
 
     app.router.add_get("/webapp", index)
     app.router.add_get("/webapp/", index)
