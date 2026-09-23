@@ -208,6 +208,8 @@ class UserStates(StatesGroup):
     waiting_card_binding = State()
     waiting_order_comment = State()
     waiting_payment_details = State()
+    waiting_operator = State()
+    waiting_operator_custom = State()
     executor_experience = State()
     executor_services = State()
     executor_comment = State()
@@ -912,6 +914,46 @@ def _payment_label(payment_type):
     }.get(payment_type, "Реквизиты")
 
 
+# ---------- Оператор мобильной связи (только для услуги "Пополнение мобильного") ----------
+MOBILE_OPERATORS = ["МТС", "МегаФон", "Билайн", "Т2", "Йота", "Добросвязь"]
+
+
+def _is_mobile_topup(service_name):
+    return "мобиль" in (service_name or "").lower()
+
+
+def _operator_keyboard():
+    rows, row = [], []
+    for i, name in enumerate(MOBILE_OPERATORS):
+        row.append(InlineKeyboardButton(text=name, callback_data=f"operator:{i}"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    rows.append([InlineKeyboardButton(text="Другой", callback_data="operator:other")])
+    rows.append([InlineKeyboardButton(text="⬅️ Изменить номер", callback_data="order:edit_payment")])
+    rows.append([InlineKeyboardButton(text="❌ Отменить", callback_data="back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _confirmation_markup():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Всё верно", callback_data="order:confirm_create")],
+        [InlineKeyboardButton(text="✏️ Изменить реквизиты", callback_data="order:edit_payment")],
+        [InlineKeyboardButton(text="⬅️ К услугам", callback_data="services")],
+    ])
+
+
+async def _apply_operator_and_build_confirmation(state: FSMContext, phone, operator):
+    """Склеивает номер и оператора в единый реквизит и возвращает (текст, клавиатуру)
+    для экрана подтверждения заявки."""
+    details = f"{phone} ({operator})"
+    await state.update_data(payment_method="phone", payment_details=details, payment_file_id=None, pending_phone=None)
+    await state.set_state(UserStates.waiting_payment_details)
+    data = await state.get_data()
+    return _payment_confirmation_text(data), _confirmation_markup()
+
+
 def _validate_payment_details(payment_type, message):
     if payment_type == "qr":
         if message.photo:
@@ -984,6 +1026,16 @@ async def order_payment_details(m: Message, state: FSMContext):
         await m.answer(msg)
         return
 
+    # Для "Пополнение мобильного" после номера нужно ещё уточнить оператора.
+    if payment_type == "phone" and _is_mobile_topup(data.get("service_name", "")):
+        await state.update_data(pending_phone=parsed["details"])
+        await state.set_state(UserStates.waiting_operator)
+        await m.answer(
+            "📶 <b>Выберите оператора</b>\n\nК какому оператору относится этот номер?",
+            reply_markup=_operator_keyboard(), parse_mode="HTML"
+        )
+        return
+
     await state.update_data(
         payment_method=parsed["method"],
         payment_details=parsed["details"],
@@ -992,12 +1044,52 @@ async def order_payment_details(m: Message, state: FSMContext):
     data = await state.get_data()
     await m.answer(
         _payment_confirmation_text(data),
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Всё верно", callback_data="order:confirm_create")],
-            [InlineKeyboardButton(text="✏️ Изменить реквизиты", callback_data="order:edit_payment")],
-            [InlineKeyboardButton(text="⬅️ К услугам", callback_data="services")],
-        ]), parse_mode="HTML"
+        reply_markup=_confirmation_markup(), parse_mode="HTML"
     )
+
+
+@dp.callback_query(UserStates.waiting_operator, F.data.startswith("operator:"))
+async def order_operator_pick(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    phone = data.get("pending_phone")
+    if not phone:
+        await c.answer("Черновик заявки не найден.", show_alert=True)
+        return
+    key = c.data.split(":", 1)[1]
+    if key == "other":
+        await state.set_state(UserStates.waiting_operator_custom)
+        await c.message.edit_text(
+            "📶 <b>Оператор</b>\n\nНапишите название оператора текстом.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Изменить номер", callback_data="order:edit_payment")],
+                [InlineKeyboardButton(text="❌ Отменить", callback_data="back")],
+            ]), parse_mode="HTML"
+        )
+        await c.answer()
+        return
+    try:
+        operator = MOBILE_OPERATORS[int(key)]
+    except (ValueError, IndexError):
+        await c.answer("Некорректный оператор.", show_alert=True)
+        return
+    text, markup = await _apply_operator_and_build_confirmation(state, phone, operator)
+    await c.message.edit_text(text, reply_markup=markup, parse_mode="HTML")
+    await c.answer()
+
+
+@dp.message(UserStates.waiting_operator_custom)
+async def order_operator_custom(m: Message, state: FSMContext):
+    if not m.text or not m.text.strip():
+        await m.answer("❌ Напишите название оператора текстом.")
+        return
+    operator = m.text.strip()[:60]
+    data = await state.get_data()
+    phone = data.get("pending_phone")
+    if not phone:
+        await m.answer("❌ Черновик заявки не найден. Начните создание заявки заново.")
+        return
+    text, markup = await _apply_operator_and_build_confirmation(state, phone, operator)
+    await m.answer(text, reply_markup=markup, parse_mode="HTML")
 
 
 @dp.callback_query(F.data == "order:back_comment")
@@ -1044,7 +1136,7 @@ async def order_back_amount(c: CallbackQuery, state: FSMContext):
     rate = get_exchange_rate()
     min_rub = float(data.get("min_amount_usdt", 0)) * rate
     await state.update_data(rate=rate)
-    await state.update_data(order_comment=None, payment_method=None, payment_details=None, payment_file_id=None, card_binding_requested=False)
+    await state.update_data(order_comment=None, payment_method=None, payment_details=None, payment_file_id=None, pending_phone=None, card_binding_requested=False)
     await state.set_state(UserStates.waiting_order_amount)
     await c.message.edit_text(
         f"💰 <b>Сумма заявки</b>\n\nМинимальная сумма: <b>{min_rub:.2f} RUB</b>\n\n"

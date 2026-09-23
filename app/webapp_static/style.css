@@ -290,9 +290,57 @@ label { font-size: 13px; color: var(--hint); display: block; margin: 8px 0 4px; 
   color: var(--text);
   border-bottom-left-radius: 4px;
 }
-.chat-input-row { display: flex; gap: 8px; align-items: flex-end; }
-.chat-input-row textarea { min-height: 42px; margin-bottom: 0; }
-.chat-input-row button { width: auto; margin-top: 0; }
+
+/* Поле ввода чата закреплено над клавиатурой/нижней навигацией (см. app.js:
+   startKeyboardAvoidance двигает `bottom` через window.visualViewport). */
+.chat-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  z-index: 30;
+  padding: 10px 16px calc(10px + var(--safe-bottom));
+  background: var(--header-bg);
+  border-top: 1px solid var(--border);
+  max-width: 640px;
+  margin: 0 auto;
+}
+.chat-input-row textarea {
+  min-height: 42px; max-height: 120px; margin-bottom: 0; flex: 1;
+  overflow-y: auto;
+}
+.chat-input-row button { width: auto; margin-top: 0; flex-shrink: 0; }
+
+/* Пока открыт чат заявки — прячем нижнюю навигацию и освобождаем место под
+   зафиксированную строку ввода, чтобы клавиатура её не перекрывала. */
+body.chat-screen #bottom-nav { display: none; }
+/* Отступ должен быть не меньше реальной высоты зафиксированной строки ввода
+   (~64px) + safe-area снизу (см. .chat-input-row) + небольшой запас, иначе
+   последнее сообщение чата оказывается под ней на устройствах с "чёлкой". */
+body.chat-screen #app { padding-bottom: calc(84px + var(--safe-bottom)); }
+.chat-thread { padding-bottom: 4px; }
+
+.requisites-card { }
+.requisites-value {
+  font-size: 17px;
+  font-weight: 700;
+  letter-spacing: 0.3px;
+  word-break: break-word;
+  margin-bottom: 10px;
+}
+.qr-box { display: flex; justify-content: center; margin: 6px 0 10px; }
+.qr-image {
+  width: 100%;
+  max-width: 220px;
+  border-radius: 12px;
+  background: #fff;
+  padding: 8px;
+}
+.qr-mode-btn.active { color: var(--success); border-color: var(--success); }
+.operator-grid { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 10px; }
+.operator-btn { width: auto; flex: 1 1 calc(33.333% - 6px); margin: 0; padding: 9px 6px; font-size: 12.5px; }
+.operator-btn.active { color: var(--success); border-color: var(--success); background: rgba(46,230,168,0.08); }
 
 .spinner {
   width: 22px; height: 22px;

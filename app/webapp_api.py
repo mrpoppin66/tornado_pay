@@ -9,7 +9,9 @@
 Аутентификация — через Telegram.WebApp.initData (см. webapp_auth.py):
 подпись проверяется на каждый запрос под /api/, отдельного логина не нужно.
 """
+import io
 import os
+import re
 from datetime import datetime, date
 from decimal import Decimal
 from html import escape as html_escape
@@ -172,6 +174,58 @@ ORDER_CREATE_ERROR_MESSAGES = {
 }
 
 
+MAX_QR_DATA_URL_LEN = 900_000  # ограничение на размер встроенного base64-изображения QR
+
+
+MOBILE_OPERATORS = ["МТС", "МегаФон", "Билайн", "Т2", "Йота", "Добросвязь"]
+
+
+def _is_mobile_topup(service_name):
+    return "мобиль" in str(service_name or "").lower()
+
+
+def _parse_webapp_payment_details(payment_type, service_name, body):
+    """Валидирует и нормализует реквизиты, присланные из Mini App, по аналогии
+    с проверкой в чат-боте (см. bot.py: _validate_payment_details)."""
+    if payment_type == "card":
+        raw = str(body.get("payment_details") or "")
+        digits = re.sub(r"\D", "", raw)
+        if not (13 <= len(digits) <= 19):
+            raise ApiError("Введите корректный номер карты (13–19 цифр).")
+        return "card", digits, None
+
+    if payment_type == "qr":
+        method = body.get("payment_method")
+        raw = body.get("payment_details")
+        if method == "qr_link":
+            value = str(raw or "").strip()
+            if not re.match(r"^https?://\S+$", value, re.IGNORECASE):
+                raise ApiError("Введите корректную ссылку на оплату (начинается с http:// или https://).")
+            return "qr_link", value, None
+        if method == "qr_photo_data":
+            value = str(raw or "")
+            if not value.startswith("data:image/"):
+                raise ApiError("Загрузите фото QR-кода.")
+            if len(value) > MAX_QR_DATA_URL_LEN:
+                raise ApiError("Изображение QR-кода слишком большое. Попробуйте другое фото.")
+            return "qr_photo_data", value, None
+        raise ApiError("Укажите ссылку на оплату или загрузите фото QR-кода.")
+
+    # phone (в т.ч. "Пополнение мобильного" и "СБП") — реквизит по умолчанию.
+    raw = str(body.get("payment_details") or "").strip()
+    digits = re.sub(r"\D", "", raw)
+    if not (7 <= len(digits) <= 15):
+        raise ApiError("Введите корректный номер телефона (7–15 цифр).")
+    if _is_mobile_topup(service_name):
+        operator = str(body.get("payment_operator") or "").strip()
+        if not operator:
+            raise ApiError("Выберите оператора.")
+        if len(operator) > 60:
+            raise ApiError("Слишком длинное название оператора.")
+        raw = f"{raw} ({operator})"
+    return "phone", raw, None
+
+
 async def api_orders_create(request: web.Request):
     uid = request["uid"]
     if not await get_user_agreement_accepted(uid):
@@ -183,11 +237,24 @@ async def api_orders_create(request: web.Request):
     except (TypeError, ValueError):
         raise ApiError("Некорректные параметры заявки.")
     comment = str(body.get("comment") or "")[:500]
-    order_id, reason = await create_order(uid, service_id, amount_rub, order_comment=comment)
+
+    service = await get_service(service_id)
+    if not service or not service["active"]:
+        raise ApiError(ORDER_CREATE_ERROR_MESSAGES["service_not_found"])
+    payment_type = service["payment_type"]
+
+    payment_method = payment_details = payment_file_id = None
+    if payment_type in ("card", "phone", "qr"):
+        payment_method, payment_details, payment_file_id = _parse_webapp_payment_details(payment_type, service["name"], body)
+
+    order_id, reason = await create_order(
+        uid, service_id, amount_rub,
+        payment_method=payment_method, payment_details=payment_details, payment_file_id=payment_file_id,
+        order_comment=comment,
+    )
     if not order_id:
         raise ApiError(ORDER_CREATE_ERROR_MESSAGES.get(reason, reason))
     await log_order_event(order_id, uid, "created", "Заявка создана через Mini App")
-    service = await get_service(service_id)
     bot = request.app["bot"]
     executors = await get_available_executors()
     order_row = await get_order(order_id)
@@ -238,6 +305,26 @@ async def api_order_detail(request: web.Request):
     data["chat_messages"] = list(reversed(rows_to_list(messages)))
     data["rated"] = (await has_rating(order_id, uid)) if data["is_client"] else None
     return web.json_response(jsonable(data))
+
+
+async def api_order_qr_image(request: web.Request):
+    """Отдаёт фото QR-кода заявки, если оно было отправлено через чат-бота
+    (хранится как Telegram file_id) — для заявок, созданных через Mini App,
+    QR уже встроен в payment_details как data:-URL и этот эндпоинт не нужен."""
+    uid = request["uid"]
+    order_id = int(request.match_info["order_id"])
+    order = await _load_order_for_participant(order_id, uid)
+    if order["payment_method"] != "qr_photo" or not order["payment_file_id"]:
+        raise ApiError("QR-код недоступен.", status=404)
+    bot = request.app["bot"]
+    buf = io.BytesIO()
+    try:
+        await bot.download(order["payment_file_id"], destination=buf)
+    except Exception as e:
+        print(f"[webapp qr image] {e}")
+        raise ApiError("Не удалось загрузить QR-код.", status=502)
+    buf.seek(0)
+    return web.Response(body=buf.read(), content_type="image/jpeg")
 
 
 async def api_order_claim(request: web.Request):
@@ -656,6 +743,7 @@ def setup_webapp_routes(app: web.Application, bot_token: str, static_dir: str):
     app.router.add_post("/api/orders", api_orders_create)
     app.router.add_get("/api/orders", api_orders_list)
     app.router.add_get("/api/orders/{order_id}", api_order_detail)
+    app.router.add_get("/api/orders/{order_id}/qr-image", api_order_qr_image)
     app.router.add_post("/api/orders/{order_id}/claim", api_order_claim)
     app.router.add_post("/api/orders/{order_id}/complete", api_order_complete)
     app.router.add_post("/api/orders/{order_id}/confirm", api_order_confirm)

@@ -43,6 +43,15 @@
   }
   var apiGet = function (path) { return apiCall(path); };
   var apiPost = function (path, body) { return apiCall(path, { method: "POST", body: JSON.stringify(body || {}) }); };
+  // Бинарные ответы (например, фото QR-кода) не проходят через apiCall (он парсит JSON),
+  // поэтому отдельный лёгкий helper с тем же заголовком авторизации.
+  function apiGetBlob(path) {
+    var headers = { "X-Telegram-Init-Data": (tg && tg.initData) || "" };
+    return fetch("/api" + path, { headers: headers }).then(function (res) {
+      if (!res.ok) throw new Error("Не удалось загрузить QR-код");
+      return res.blob();
+    });
+  }
 
   // ---------- Утилиты ----------
   function esc(s) {
@@ -129,6 +138,51 @@
     document.body.appendChild(el);
     setTimeout(function () { el.remove(); }, 3000);
   }
+  function copyText(value, successMsg) {
+    function fallback() {
+      var ta = document.createElement("textarea");
+      ta.value = value;
+      ta.style.cssText = "position:fixed;left:-9999px;top:0";
+      document.body.appendChild(ta);
+      ta.select();
+      try { document.execCommand("copy"); } catch (e) {}
+      document.body.removeChild(ta);
+    }
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(value).then(function () {
+        toast(successMsg || "Скопировано");
+      }).catch(function () { fallback(); toast(successMsg || "Скопировано"); });
+    } else {
+      fallback();
+      toast(successMsg || "Скопировано");
+    }
+  }
+  // Уменьшает фото QR-кода перед отправкой на сервер, чтобы не раздувать БД:
+  // приводит к JPEG, ограничивает сторону и качество.
+  function fileToCompressedDataUrl(file, maxDim, quality) {
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onerror = function () { reject(new Error("Не удалось прочитать файл")); };
+      reader.onload = function () {
+        var img = new Image();
+        img.onerror = function () { reject(new Error("Не удалось прочитать изображение")); };
+        img.onload = function () {
+          var w = img.width, h = img.height;
+          var scale = Math.min(1, maxDim / Math.max(w, h));
+          var canvas = document.createElement("canvas");
+          canvas.width = Math.round(w * scale);
+          canvas.height = Math.round(h * scale);
+          var ctx = canvas.getContext("2d");
+          ctx.fillStyle = "#fff";
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+          resolve(canvas.toDataURL("image/jpeg", quality || 0.82));
+        };
+        img.src = reader.result;
+      };
+      reader.readAsDataURL(file);
+    });
+  }
 
   var ORDER_STATUS_LABELS = {
     new: "🆕 новая", in_progress: "🔧 в работе", awaiting_confirmation: "⏳ ожидает подтверждения",
@@ -139,6 +193,7 @@
     rejected: "❌ отклонена", blocked: "🚫 заблокирована",
   };
   var PROVIDER_LABELS = { cryptobot: "CryptoBot", xrocket: "xRocket" };
+  var MOBILE_OPERATORS = ["МТС", "МегаФон", "Билайн", "Т2", "Йота", "Добросвязь"];
 
   // ---------- Состояние ----------
   var ME = null;
@@ -146,6 +201,39 @@
 
   function stopChatPoll() {
     if (chatPollTimer) { clearInterval(chatPollTimer); chatPollTimer = null; }
+  }
+
+  // ---------- Поднятие поля ввода чата над экранной клавиатурой ----------
+  // На iOS/Android Telegram WebView "position: fixed" считается относительно
+  // layout-вьюпорта, а не видимой области — при открытии клавиатуры её нижняя
+  // граница уезжает вниз под клавиатуру. window.visualViewport даёт реальную
+  // видимую высоту, поэтому сдвигаем панель ввода на разницу высот.
+  var kbResizeHandler = null;
+  function startKeyboardAvoidance() {
+    stopKeyboardAvoidance();
+    if (!window.visualViewport) return;
+    function reposition() {
+      var row = document.getElementById("chat-input-row");
+      if (!row) return;
+      var vv = window.visualViewport;
+      var offset = Math.max(0, (window.innerHeight - vv.height - vv.offsetTop));
+      row.style.bottom = offset + "px";
+      var thread = document.getElementById("chat-thread");
+      if (thread && offset > 0) thread.scrollTop = thread.scrollHeight;
+    }
+    kbResizeHandler = reposition;
+    window.visualViewport.addEventListener("resize", kbResizeHandler);
+    window.visualViewport.addEventListener("scroll", kbResizeHandler);
+    reposition();
+  }
+  function stopKeyboardAvoidance() {
+    if (kbResizeHandler && window.visualViewport) {
+      window.visualViewport.removeEventListener("resize", kbResizeHandler);
+      window.visualViewport.removeEventListener("scroll", kbResizeHandler);
+    }
+    kbResizeHandler = null;
+    var row = document.getElementById("chat-input-row");
+    if (row) row.style.bottom = "";
   }
 
   function loadMe() {
@@ -164,7 +252,14 @@
   // ---------- Роутер ----------
   var routes = [];
   function route(pattern, handler) { routes.push({ re: pattern, handler: handler }); }
-  function currentHash() { return location.hash.replace(/^#/, "") || "/home"; }
+  function currentHash() {
+    var h = location.hash.replace(/^#/, "");
+    // Telegram дописывает в hash свои служебные параметры при открытии Mini App
+    // (например "tgWebAppData=..."), из-за чего роутер не находил маршрут и
+    // показывал "Раздел не найден". Валидный маршрут у нас всегда начинается с "/".
+    if (!h || h.charAt(0) !== "/") return "/home";
+    return h;
+  }
 
   function setActiveNav(hash) {
     var base = "/" + hash.split("/")[1];
@@ -175,6 +270,8 @@
 
   function render() {
     stopChatPoll();
+    stopKeyboardAvoidance();
+    document.body.classList.remove("chat-screen");
     var root = document.getElementById("app");
     var hash = currentHash();
 
@@ -333,15 +430,53 @@
       var s = services.filter(function (x) { return String(x.id) === serviceId; })[0];
       if (!s) { root.innerHTML = '<div class="error-box">Услуга не найдена</div>'; return; }
       var rate = ME.exchange_rate || 1;
+      var pt = s.payment_type || "phone";
+      var isMobileTopup = pt === "phone" && cleanServiceName(s.name).toLowerCase().indexOf("мобиль") !== -1;
+      var qrMode = "link"; // текущий выбранный способ передачи QR ("link" | "photo")
+      var qrPhotoDataUrl = null;
+      var selectedOperator = null;
+
+      var reqFieldsHtml = "";
+      if (pt === "card") {
+        reqFieldsHtml =
+          '<label>Номер карты</label>' +
+          '<input type="text" inputmode="numeric" autocomplete="off" id="req-card" placeholder="0000 0000 0000 0000" maxlength="23">';
+      } else if (pt === "qr") {
+        reqFieldsHtml =
+          '<label>Реквизиты — QR-код для оплаты</label>' +
+          '<div class="row" style="margin-bottom:8px">' +
+          '<button type="button" class="secondary small qr-mode-btn active" id="qr-mode-link" style="flex:1">🔗 Ссылка</button>' +
+          '<button type="button" class="secondary small qr-mode-btn" id="qr-mode-photo" style="flex:1">📷 Фото QR</button>' +
+          "</div>" +
+          '<div id="qr-link-box"><input type="url" id="req-qr-link" placeholder="https://..."></div>' +
+          '<div id="qr-photo-box" style="display:none">' +
+          '<input type="file" accept="image/*" id="req-qr-file">' +
+          '<div id="qr-photo-preview"></div>' +
+          "</div>";
+      } else if (pt === "phone") {
+        reqFieldsHtml = '<label>Номер телефона</label><input type="tel" autocomplete="off" id="req-phone" placeholder="+79991234567">';
+        if (isMobileTopup) {
+          reqFieldsHtml += '<label>Оператор</label><div class="operator-grid" id="operator-grid">' +
+            MOBILE_OPERATORS.map(function (op) {
+              return '<button type="button" class="secondary small operator-btn" data-op="' + esc(op) + '">' + esc(op) + "</button>";
+            }).join("") +
+            '<button type="button" class="secondary small operator-btn" data-op="__other__">Другой</button>' +
+            "</div>" +
+            '<div id="operator-other-box" style="display:none"><input type="text" id="operator-other-input" placeholder="Название оператора"></div>';
+        }
+      }
+
       root.innerHTML =
         '<h1>' + esc(s.name) + "</h1>" +
         (s.description ? '<p class="muted">' + esc(s.description) + "</p>" : "") +
         '<label>Сумма перевода, ₽</label>' +
         '<input type="number" inputmode="decimal" id="amount-input" placeholder="Например, 1000">' +
+        reqFieldsHtml +
         '<label>Комментарий (необязательно)</label>' +
         '<textarea id="comment-input" placeholder="Уточнения для исполнителя"></textarea>' +
         '<div id="estimate" class="muted"></div>' +
         '<button id="create-order-btn">Создать заявку</button>';
+
       var amountInput = document.getElementById("amount-input");
       var estimateEl = document.getElementById("estimate");
       amountInput.oninput = function () {
@@ -349,15 +484,90 @@
         if (!v || v <= 0) { estimateEl.textContent = ""; return; }
         estimateEl.textContent = "≈ " + fmt(v / rate, 4) + " USDT по курсу " + fmt(rate, 2);
       };
+
+      if (pt === "qr") {
+        var linkBox = document.getElementById("qr-link-box");
+        var photoBox = document.getElementById("qr-photo-box");
+        var modeLinkBtn = document.getElementById("qr-mode-link");
+        var modePhotoBtn = document.getElementById("qr-mode-photo");
+        var preview = document.getElementById("qr-photo-preview");
+        function setQrMode(mode) {
+          qrMode = mode;
+          linkBox.style.display = mode === "link" ? "" : "none";
+          photoBox.style.display = mode === "photo" ? "" : "none";
+          modeLinkBtn.classList.toggle("active", mode === "link");
+          modePhotoBtn.classList.toggle("active", mode === "photo");
+        }
+        modeLinkBtn.onclick = function () { setQrMode("link"); };
+        modePhotoBtn.onclick = function () { setQrMode("photo"); };
+        document.getElementById("req-qr-file").onchange = function (ev) {
+          var file = ev.target.files && ev.target.files[0];
+          if (!file) return;
+          preview.innerHTML = '<div class="muted">Обработка фото…</div>';
+          fileToCompressedDataUrl(file, 700, 0.82).then(function (dataUrl) {
+            qrPhotoDataUrl = dataUrl;
+            preview.innerHTML = '<img src="' + dataUrl + '" class="qr-image" alt="QR-код">';
+          }).catch(function (e) {
+            qrPhotoDataUrl = null;
+            preview.innerHTML = '<div class="muted">' + esc(e.message) + "</div>";
+          });
+        };
+      }
+
+      if (isMobileTopup) {
+        var otherBox = document.getElementById("operator-other-box");
+        document.querySelectorAll("#operator-grid .operator-btn").forEach(function (btn) {
+          btn.onclick = function () {
+            document.querySelectorAll("#operator-grid .operator-btn").forEach(function (b) { b.classList.remove("active"); });
+            btn.classList.add("active");
+            var op = btn.getAttribute("data-op");
+            if (op === "__other__") {
+              otherBox.style.display = "";
+              selectedOperator = document.getElementById("operator-other-input").value.trim();
+            } else {
+              otherBox.style.display = "none";
+              selectedOperator = op;
+            }
+          };
+        });
+        document.getElementById("operator-other-input").oninput = function () {
+          selectedOperator = this.value.trim();
+        };
+      }
+
       document.getElementById("create-order-btn").onclick = function () {
         var amount = parseFloat(amountInput.value);
         if (!amount || amount <= 0) { toast("Введите сумму", true); return; }
-        this.disabled = true;
-        var btn = this;
-        apiPost("/orders", {
+        var payload = {
           service_id: s.id, amount_rub: amount,
           comment: document.getElementById("comment-input").value,
-        }).then(function (res) {
+        };
+        if (pt === "card") {
+          var cardVal = document.getElementById("req-card").value.replace(/\D/g, "");
+          if (cardVal.length < 13 || cardVal.length > 19) { toast("Введите корректный номер карты", true); return; }
+          payload.payment_method = "card"; payload.payment_details = cardVal;
+        } else if (pt === "phone") {
+          var phoneVal = document.getElementById("req-phone").value.trim();
+          var phoneDigits = phoneVal.replace(/\D/g, "");
+          if (phoneDigits.length < 7 || phoneDigits.length > 15) { toast("Введите корректный номер телефона", true); return; }
+          payload.payment_method = "phone"; payload.payment_details = phoneVal;
+          if (isMobileTopup) {
+            if (!selectedOperator) { toast("Выберите оператора", true); return; }
+            payload.payment_operator = selectedOperator;
+          }
+        } else if (pt === "qr") {
+          if (qrMode === "link") {
+            var linkVal = document.getElementById("req-qr-link").value.trim();
+            if (!/^https?:\/\/\S+$/i.test(linkVal)) { toast("Введите корректную ссылку", true); return; }
+            payload.payment_method = "qr_link"; payload.payment_details = linkVal;
+          } else {
+            if (!qrPhotoDataUrl) { toast("Загрузите фото QR-кода", true); return; }
+            payload.payment_method = "qr_photo_data"; payload.payment_details = qrPhotoDataUrl;
+          }
+        }
+        this.disabled = true;
+        var btn = this;
+        apiPost("/orders", payload).then(function (res) {
           haptic("success");
           toast("Заявка #" + res.order_id + " создана");
           location.hash = "#/order/" + res.order_id;
@@ -421,6 +631,41 @@
     });
   });
 
+  // Реквизиты оплаты: подпись, копируемое значение и (если применимо) блок QR-кода.
+  function paymentRequisitesBlock(o) {
+    var method = o.payment_method;
+    if (!method) return "";
+    var label = "", valueText = "", qrHtml = "";
+    if (method === "card") {
+      label = "💳 Номер карты";
+      var digits = String(o.payment_details || "").replace(/\D/g, "");
+      valueText = digits.replace(/(.{4})(?=.)/g, "$1 ");
+    } else if (method === "phone") {
+      label = "📱 Номер телефона";
+      valueText = o.payment_details || "";
+    } else if (method === "qr_link") {
+      label = "🧾 Ссылка на оплату (QR)";
+      valueText = o.payment_details || "";
+      qrHtml = '<div class="qr-box"><img class="qr-image" src="https://api.qrserver.com/v1/create-qr-code/?size=240x240&data=' +
+        encodeURIComponent(o.payment_details || "") + '" alt="QR-код"></div>';
+    } else if (method === "qr_photo_data") {
+      label = "🧾 QR-код для оплаты";
+      qrHtml = '<div class="qr-box"><img class="qr-image" src="' + esc(o.payment_details) + '" alt="QR-код"></div>';
+    } else if (method === "qr_photo") {
+      label = "🧾 QR-код для оплаты";
+      qrHtml = '<div class="qr-box" id="qr-photo-box"><div class="muted">Загрузка QR-кода…</div></div>';
+    } else {
+      return "";
+    }
+    var copyBtn = valueText
+      ? '<button class="secondary small icon-button-inline" id="copy-req-btn"><span class="btn-icon">' + svgIcon('copy') + '</span> Скопировать реквизиты</button>'
+      : "";
+    return '<div class="card requisites-card">' +
+      '<div class="muted" style="margin-bottom:5px">' + label + "</div>" +
+      (valueText ? '<div class="requisites-value">' + esc(valueText) + "</div>" : "") +
+      qrHtml + copyBtn + "</div>";
+  }
+
   function renderOrderDetail(root, o) {
     var st = o.status;
     var isClient = o.is_client, isExecutor = o.is_executor;
@@ -431,7 +676,8 @@
       '<div><b>Сумма:</b> ' + fmt(o.amount_rub, 0) + " ₽ (" + fmt(o.user_amount_usdt, 4) + " USDT)</div>" +
       (o.order_comment ? '<div><b>Комментарий:</b> ' + esc(o.order_comment) + "</div>" : "") +
       '<div class="muted" style="margin-top:6px">Создана: ' + fmtDate(o.created_at) + "</div>" +
-      "</div>";
+      "</div>" +
+      paymentRequisitesBlock(o);
 
     // Действия в зависимости от роли и статуса.
     var actions = "";
@@ -451,13 +697,31 @@
     html += actions;
 
     if (o.chat_open) {
+      document.body.classList.add("chat-screen");
       html += '<h2>💬 Чат</h2><div class="chat-thread" id="chat-thread">' + renderChatMessages(o.chat_messages, o) + "</div>" +
-        '<div class="chat-input-row"><textarea id="chat-input" placeholder="Сообщение..." rows="1"></textarea>' +
+        '<div class="chat-input-row" id="chat-input-row"><textarea id="chat-input" placeholder="Сообщение..." rows="1"></textarea>' +
         '<button id="chat-send-btn" class="small">➤</button></div>';
+    } else {
+      document.body.classList.remove("chat-screen");
     }
 
     root.innerHTML = html;
     root.dataset.orderId = o.id;
+
+    var qrPhotoBox = document.getElementById("qr-photo-box");
+    if (qrPhotoBox) {
+      apiGetBlob("/orders/" + o.id + "/qr-image").then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        qrPhotoBox.innerHTML = '<img class="qr-image" src="' + url + '" alt="QR-код">';
+      }).catch(function () {
+        qrPhotoBox.innerHTML = '<div class="muted">QR-код недоступен</div>';
+      });
+    }
+    var copyReqBtn = document.getElementById("copy-req-btn");
+    if (copyReqBtn) copyReqBtn.onclick = function () {
+      var valueEl = root.querySelector(".requisites-value");
+      copyText(valueEl ? valueEl.textContent : (o.payment_details || ""), "Реквизиты скопированы");
+    };
 
     var completeBtn = document.getElementById("complete-btn");
     if (completeBtn) completeBtn.onclick = function () {
@@ -506,6 +770,24 @@
         pollChat(o.id, true);
       }).catch(function (e) { chatSendBtn.disabled = false; toast(e.message, true); });
     };
+    if (chatInput) {
+      // Enter отправляет сообщение, Shift+Enter — перенос строки.
+      chatInput.onkeydown = function (ev) {
+        if (ev.key === "Enter" && !ev.shiftKey) {
+          ev.preventDefault();
+          if (chatSendBtn) chatSendBtn.onclick();
+        }
+      };
+      chatInput.addEventListener("focus", function () {
+        setTimeout(startKeyboardAvoidance, 50);
+      });
+      chatInput.addEventListener("blur", function () {
+        setTimeout(startKeyboardAvoidance, 50);
+      });
+      startKeyboardAvoidance();
+      var thread0 = document.getElementById("chat-thread");
+      if (thread0) thread0.scrollTop = thread0.scrollHeight;
+    }
   }
 
   function renderChatMessages(messages, o) {
