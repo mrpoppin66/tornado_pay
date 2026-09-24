@@ -415,6 +415,7 @@ def render_order_detail(o):
     payment_method = o[12]
     payment_details = o[13]
     payment_file_id = o[14]
+    dispute_reason = o[17] if len(o) > 17 else None
     if payment_method == "qr_photo":
         payment_text = "📷 Фото QR-кода загружено"
     elif payment_method == "qr_link":
@@ -433,7 +434,8 @@ def render_order_detail(o):
         f"<b>Сумма в рублях:</b> {amount_rub:.2f} RUB\n"
         f"<b>Сумма в USDT:</b> {user_amount_usdt:.4f} USDT\n\n"
         f"<b>Реквизиты для перевода:</b>\n{payment_text}\n\n"
-        f"<b>Разбор:</b>\n"
+        + (f"<b>⚠️ Причина спора (от клиента):</b>\n{escape(dispute_reason)}\n\n" if o[9] == "disputed" and dispute_reason else "")
+        + f"<b>Разбор:</b>\n"
         f"Вам (комиссия): {owner_comm:.4f} USDT\n"
         f"Исполнителю: {executor_gets_usdt:.4f} USDT\n\n"
         f"Статус: {ORDER_STATUS_LABELS.get(o[9], o[9])}\n"

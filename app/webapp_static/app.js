@@ -198,9 +198,48 @@
   // ---------- Состояние ----------
   var ME = null;
   var chatPollTimer = null;
+  var orderStatusPollTimer = null;
 
   function stopChatPoll() {
     if (chatPollTimer) { clearInterval(chatPollTimer); chatPollTimer = null; }
+  }
+
+  // ---------- Автообновление статуса заявки ----------
+  // Пока открыт экран конкретной заявки, раз в 5с сверяем статус/исполнителя
+  // с сервером — если что-то изменилось (взяли в работу, подтвердили,
+  // открыли спор), тихо перерисовываем экран и показываем тост, вместо того
+  // чтобы человек узнавал об этом только вручную обновив страницу.
+  function stopOrderStatusPoll() {
+    if (orderStatusPollTimer) { clearInterval(orderStatusPollTimer); orderStatusPollTimer = null; }
+  }
+  function startOrderStatusPoll(orderId, status, executorId) {
+    stopOrderStatusPoll();
+    var known = { status: status, executor_id: executorId };
+    orderStatusPollTimer = setInterval(function () {
+      apiGet("/orders/" + orderId).then(function (o) {
+        if (o.status === known.status && o.executor_id === known.executor_id) return;
+        known = { status: o.status, executor_id: o.executor_id };
+        // Сохраняем черновики, чтобы перерисовка не стёрла то, что человек уже печатает.
+        var chatInputEl = document.getElementById("chat-input");
+        var chatDraft = chatInputEl ? chatInputEl.value : "";
+        var disputeEl = document.getElementById("dispute-reason");
+        var disputeDraft = disputeEl ? disputeEl.value : "";
+        var disputeWasOpen = !!(disputeEl && disputeEl.closest("#dispute-form") && disputeEl.closest("#dispute-form").style.display !== "none");
+        renderOrderDetail(document.getElementById("app"), o);
+        stopChatPoll();
+        if (o.chat_open) startChatPoll(orderId, o.chat_messages);
+        var newChatInput = document.getElementById("chat-input");
+        if (newChatInput && chatDraft) newChatInput.value = chatDraft;
+        if (disputeWasOpen) {
+          var disputeBtn2 = document.getElementById("dispute-btn");
+          if (disputeBtn2) disputeBtn2.onclick();
+          var newDisputeEl = document.getElementById("dispute-reason");
+          if (newDisputeEl && disputeDraft) newDisputeEl.value = disputeDraft;
+        }
+        toast("Статус заявки обновился: " + (ORDER_STATUS_LABELS[o.status] || o.status));
+        haptic("light");
+      }).catch(function () {});
+    }, 5000);
   }
 
   // ---------- Поднятие поля ввода чата над экранной клавиатурой ----------
@@ -270,10 +309,12 @@
 
   function render() {
     stopChatPoll();
+    stopOrderStatusPoll();
     stopKeyboardAvoidance();
     document.body.classList.remove("chat-screen");
     var root = document.getElementById("app");
     var hash = currentHash();
+    updateBackButton(hash);
 
     if (!ME) {
       root.innerHTML = '<div class="spinner"></div>';
@@ -296,6 +337,33 @@
       }
     }
     root.innerHTML = '<div class="empty-state"><span class="emoji">🤷</span>Раздел не найден</div>';
+  }
+
+  // ---------- Аппаратная/жестовая кнопка "назад" Telegram ----------
+  // Без этого системный свайв/аппаратная кнопка "назад" на телефоне закрывает
+  // весь мини-апп, а не возвращает на предыдущий экран внутри SPA.
+  var TOP_LEVEL_ROUTES = ["/home", "/services", "/orders", "/balance", "/executor"];
+  function updateBackButton(hash) {
+    if (!tg || !tg.BackButton) return;
+    var base = "/" + hash.split("/")[1];
+    try {
+      if (TOP_LEVEL_ROUTES.indexOf(base) !== -1 || hash === "/agreement") {
+        tg.BackButton.hide();
+      } else {
+        tg.BackButton.show();
+      }
+    } catch (e) {}
+  }
+  if (tg && tg.BackButton) {
+    try {
+      tg.BackButton.onClick(function () {
+        if (history.length > 1) {
+          history.back();
+        } else {
+          location.hash = "#/home";
+        }
+      });
+    } catch (e) {}
   }
 
   function renderError(root, e) {
@@ -628,6 +696,7 @@
     return apiGet("/orders/" + orderId).then(function (o) {
       renderOrderDetail(root, o);
       if (o.chat_open) startChatPoll(orderId, o.chat_messages);
+      startOrderStatusPoll(orderId, o.status, o.executor_id);
     });
   });
 
@@ -686,7 +755,13 @@
     }
     if (isClient && st === "awaiting_confirmation") {
       actions += '<button id="confirm-btn">✅ Подтвердить выполнение</button>' +
-        '<button id="dispute-btn" class="danger">⚠️ Открыть спор</button>';
+        '<button id="dispute-btn" class="danger">⚠️ Открыть спор</button>' +
+        '<div class="card" id="dispute-form" style="display:none">' +
+        '<label>Опишите проблему — это увидит администратор</label>' +
+        '<textarea id="dispute-reason" placeholder="Например: перевёл деньги, но исполнитель не подтверждает получение"></textarea>' +
+        '<button id="dispute-submit-btn" class="danger">Отправить администратору</button>' +
+        '<button id="dispute-cancel-btn" class="secondary small">Отмена</button>' +
+        "</div>";
     }
     if (isClient && st === "done" && o.rated === false) {
       actions += '<div class="card"><div style="margin-bottom:6px">Оцените исполнителя:</div>' +
@@ -699,7 +774,10 @@
     if (o.chat_open) {
       document.body.classList.add("chat-screen");
       html += '<h2>💬 Чат</h2><div class="chat-thread" id="chat-thread">' + renderChatMessages(o.chat_messages, o) + "</div>" +
-        '<div class="chat-input-row" id="chat-input-row"><textarea id="chat-input" placeholder="Сообщение..." rows="1"></textarea>' +
+        '<div class="chat-input-row" id="chat-input-row">' +
+        '<button id="chat-attach-btn" class="small secondary" type="button" title="Прикрепить фото">📎</button>' +
+        '<input type="file" accept="image/*" id="chat-photo-input" style="display:none">' +
+        '<textarea id="chat-input" placeholder="Сообщение..." rows="1"></textarea>' +
         '<button id="chat-send-btn" class="small">➤</button></div>';
     } else {
       document.body.classList.remove("chat-screen");
@@ -707,6 +785,7 @@
 
     root.innerHTML = html;
     root.dataset.orderId = o.id;
+    loadChatPhotos(o.id);
 
     var qrPhotoBox = document.getElementById("qr-photo-box");
     if (qrPhotoBox) {
@@ -738,12 +817,28 @@
       }).catch(function (e) { confirmBtn.disabled = false; toast(e.message, true); });
     };
     var disputeBtn = document.getElementById("dispute-btn");
+    var disputeForm = document.getElementById("dispute-form");
     if (disputeBtn) disputeBtn.onclick = function () {
-      if (!confirm("Открыть спор по заявке? Решение примет администратор.")) return;
-      this.disabled = true;
-      apiPost("/orders/" + o.id + "/dispute").then(function () {
-        haptic("warning"); toast("Спор открыт"); render();
-      }).catch(function (e) { disputeBtn.disabled = false; toast(e.message, true); });
+      disputeBtn.style.display = "none";
+      if (confirmBtn) confirmBtn.style.display = "none";
+      disputeForm.style.display = "";
+      var reasonEl = document.getElementById("dispute-reason");
+      reasonEl.focus();
+    };
+    var disputeCancelBtn = document.getElementById("dispute-cancel-btn");
+    if (disputeCancelBtn) disputeCancelBtn.onclick = function () {
+      disputeForm.style.display = "none";
+      disputeBtn.style.display = "";
+      if (confirmBtn) confirmBtn.style.display = "";
+    };
+    var disputeSubmitBtn = document.getElementById("dispute-submit-btn");
+    if (disputeSubmitBtn) disputeSubmitBtn.onclick = function () {
+      var reason = document.getElementById("dispute-reason").value.trim();
+      if (!reason) { toast("Опишите проблему", true); return; }
+      disputeSubmitBtn.disabled = true;
+      apiPost("/orders/" + o.id + "/dispute", { reason: reason }).then(function () {
+        haptic("warning"); toast("Спор открыт, администратор разберётся"); render();
+      }).catch(function (e) { disputeSubmitBtn.disabled = false; toast(e.message, true); });
     };
     var starsEl = document.getElementById("rate-stars");
     if (starsEl) {
@@ -760,6 +855,8 @@
     }
     var chatInput = document.getElementById("chat-input");
     var chatSendBtn = document.getElementById("chat-send-btn");
+    var chatAttachBtn = document.getElementById("chat-attach-btn");
+    var chatPhotoInput = document.getElementById("chat-photo-input");
     if (chatSendBtn) chatSendBtn.onclick = function () {
       var text = chatInput.value.trim();
       if (!text) return;
@@ -769,6 +866,23 @@
         chatSendBtn.disabled = false;
         pollChat(o.id, true);
       }).catch(function (e) { chatSendBtn.disabled = false; toast(e.message, true); });
+    };
+    if (chatAttachBtn) chatAttachBtn.onclick = function () { chatPhotoInput.click(); };
+    if (chatPhotoInput) chatPhotoInput.onchange = function (ev) {
+      var file = ev.target.files && ev.target.files[0];
+      if (!file) return;
+      chatAttachBtn.disabled = true;
+      fileToCompressedDataUrl(file, 1000, 0.8).then(function (dataUrl) {
+        return apiPost("/orders/" + o.id + "/chat/photo", { photo: dataUrl });
+      }).then(function () {
+        chatAttachBtn.disabled = false;
+        chatPhotoInput.value = "";
+        pollChat(o.id, true);
+      }).catch(function (e) {
+        chatAttachBtn.disabled = false;
+        chatPhotoInput.value = "";
+        toast(e.message, true);
+      });
     };
     if (chatInput) {
       // Enter отправляет сообщение, Shift+Enter — перенос строки.
@@ -794,9 +908,28 @@
     if (!messages.length) return '<div class="muted" style="text-align:center;padding:12px 0">Сообщений пока нет</div>';
     return messages.map(function (m) {
       var mine = (o.is_client && m.sender_id === o.user_id) || (o.is_executor && m.sender_id === o.executor_id);
-      var text = m.content_type === "text" ? esc(m.text_content) : "[вложение]";
-      return '<div class="chat-bubble ' + (mine ? "me" : "peer") + '">' + text + "</div>";
+      var cls = "chat-bubble " + (mine ? "me" : "peer");
+      if (m.content_type === "photo") {
+        return '<div class="' + cls + ' chat-bubble-photo" id="chat-photo-' + m.id + '" data-msg-id="' + m.id + '">' +
+          '<div class="muted">Загрузка фото…</div></div>';
+      }
+      return '<div class="' + cls + '">' + esc(m.text_content) + "</div>";
     }).join("");
+  }
+
+  // Догружает байты фото для всех ещё не загруженных фото-пузырей в текущем треде.
+  function loadChatPhotos(orderId) {
+    document.querySelectorAll(".chat-bubble-photo").forEach(function (box) {
+      if (box.dataset.loaded) return;
+      box.dataset.loaded = "1";
+      var msgId = box.getAttribute("data-msg-id");
+      apiGetBlob("/orders/" + orderId + "/chat/" + msgId + "/photo").then(function (blob) {
+        var url = URL.createObjectURL(blob);
+        box.innerHTML = '<img src="' + url + '" class="chat-photo-img" alt="Фото">';
+      }).catch(function () {
+        box.innerHTML = '<div class="muted">Фото недоступно</div>';
+      });
+    });
   }
 
   var lastChatId = 0;
@@ -814,6 +947,7 @@
         if (!t2) return;
         t2.innerHTML = renderChatMessages(o.chat_messages, o);
         t2.scrollTop = t2.scrollHeight;
+        loadChatPhotos(orderId);
         if (o.chat_messages.length) lastChatId = o.chat_messages[o.chat_messages.length - 1].id;
       });
     }).catch(function () {});
@@ -1142,8 +1276,10 @@
     render();
     refreshNotifBadge();
     setInterval(refreshNotifBadge, 20000);
+    if (window.TornadoPaySplash) window.TornadoPaySplash.hide();
   }).catch(function (e) {
     document.getElementById("app").innerHTML = '<div class="error-box">Не удалось загрузить данные: ' + esc(e.message) +
       "</div><p class=\"muted\">Откройте приложение через кнопку в боте Telegram.</p>";
+    if (window.TornadoPaySplash) window.TornadoPaySplash.hide();
   });
 })();

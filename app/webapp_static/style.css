@@ -311,6 +311,10 @@ label { font-size: 13px; color: var(--hint); display: block; margin: 8px 0 4px; 
   overflow-y: auto;
 }
 .chat-input-row button { width: auto; margin-top: 0; flex-shrink: 0; }
+.chat-input-row .secondary { padding: 10px 12px; }
+.chat-bubble-photo { padding: 4px; background: transparent !important; border: none !important; }
+.chat-bubble-photo .muted { padding: 8px 12px; }
+.chat-photo-img { max-width: 220px; max-height: 260px; border-radius: 12px; display: block; }
 
 /* Пока открыт чат заявки — прячем нижнюю навигацию и освобождаем место под
    зафиксированную строку ввода, чтобы клавиатура её не перекрывала. */

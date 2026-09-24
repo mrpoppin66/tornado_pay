@@ -9,6 +9,7 @@
 Аутентификация — через Telegram.WebApp.initData (см. webapp_auth.py):
 подпись проверяется на каждый запрос под /api/, отдельного логина не нужно.
 """
+import base64
 import io
 import os
 import re
@@ -17,7 +18,7 @@ from decimal import Decimal
 from html import escape as html_escape
 
 from aiohttp import web
-from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton, BufferedInputFile
 
 from . import xrocket
 from . import cryptobot
@@ -34,7 +35,7 @@ from .db import (
     create_executor_application, answer_executor_application,
     submit_order_rating, has_rating,
     get_order_chat_peer, save_order_chat_message, get_order_chat_messages_after,
-    get_recent_chat_messages,
+    get_recent_chat_messages, get_chat_message,
     get_order,
     get_user_transactions,
     create_deposit, mark_deposit_paid,
@@ -404,21 +405,29 @@ async def api_order_confirm(request: web.Request):
 async def api_order_dispute(request: web.Request):
     uid = request["uid"]
     order_id = int(request.match_info["order_id"])
-    executor_id = await dispute_order_by_client(order_id, uid)
+    body = await _json_body(request)
+    reason = str(body.get("reason") or "").strip()[:500]
+    if not reason:
+        raise ApiError("Опишите проблему — это поможет администратору быстрее разобраться.")
+    executor_id = await dispute_order_by_client(order_id, uid, reason=reason)
     if executor_id is None:
         raise ApiError("Заявка уже обработана или недоступна.")
-    await log_order_event(order_id, uid, "dispute_opened", "Клиент открыл спор (Mini App)")
-    await create_notification(executor_id, "dispute", f"⚖️ Спор по заявке #{order_id}", "Клиент открыл спор.", order_id)
+    await log_order_event(order_id, uid, "dispute_opened", f"Клиент открыл спор (Mini App): {reason}")
+    await create_notification(executor_id, "dispute", f"⚖️ Спор по заявке #{order_id}", reason, order_id)
     bot = request.app["bot"]
     try:
-        await bot.send_message(executor_id, f"⚠️ <b>По заявке #{order_id} открыт спор.</b>\n\nСредства остаются в резерве до решения администрации.", parse_mode="HTML")
+        await bot.send_message(
+            executor_id,
+            f"⚠️ <b>По заявке #{order_id} открыт спор.</b>\n\n<b>Причина:</b> {html_escape(reason)}\n\nСредства остаются в резерве до решения администрации.",
+            parse_mode="HTML",
+        )
     except Exception as e:
         print(f"[webapp dispute notify] {e}")
     for admin_id in await get_admin_ids():
         try:
             await bot.send_message(
                 admin_id,
-                f"⚠️ <b>Открыт спор по заявке #{order_id}</b>\n\nКлиент: <code>{uid}</code>\nИсполнитель: <code>{executor_id}</code>",
+                f"⚠️ <b>Открыт спор по заявке #{order_id}</b>\n\nКлиент: <code>{uid}</code>\nИсполнитель: <code>{executor_id}</code>\n\n<b>Причина:</b> {html_escape(reason)}",
                 parse_mode="HTML",
             )
         except Exception as e:
@@ -483,6 +492,69 @@ async def api_order_chat_send(request: web.Request):
     await log_order_event(order_id, uid, "chat_message", "Новое сообщение в анонимном чате (Mini App)")
     await create_notification(peer["peer_id"], "chat", f"💬 Новое сообщение по заявке #{order_id}", "Откройте чат, чтобы прочитать сообщение.", order_id)
     return web.json_response({"ok": True})
+
+
+MAX_CHAT_PHOTO_DATA_URL_LEN = 900_000  # ограничение на размер вложения (после сжатия на клиенте)
+
+
+async def api_order_chat_send_photo(request: web.Request):
+    """Отправка фото (например, скриншота оплаты) в анонимный чат заявки.
+    Фото уходит собеседнику обычным сообщением через бота (как и текст), а
+    полученный Telegram file_id сохраняется в истории для показа в Mini App."""
+    uid = request["uid"]
+    order_id = int(request.match_info["order_id"])
+    body = await _json_body(request)
+    data_url = str(body.get("photo") or "")
+    if not data_url.startswith("data:image/"):
+        raise ApiError("Приложите фотографию.")
+    if len(data_url) > MAX_CHAT_PHOTO_DATA_URL_LEN:
+        raise ApiError("Фото слишком большое. Попробуйте другое изображение.")
+    try:
+        header, b64data = data_url.split(",", 1)
+        photo_bytes = base64.b64decode(b64data)
+    except Exception:
+        raise ApiError("Не удалось прочитать изображение.")
+    peer = await get_order_chat_peer(order_id, uid)
+    if not peer:
+        raise ApiError("Чат по этой заявке сейчас закрыт.", status=403)
+    sender_label = "👤 Клиент" if peer["side"] == "client" else "🧑‍💼 Исполнитель"
+    bot = request.app["bot"]
+    try:
+        delivered = await bot.send_photo(
+            peer["peer_id"],
+            BufferedInputFile(photo_bytes, filename="photo.jpg"),
+            caption=sender_label,
+        )
+    except Exception as e:
+        raise ApiError(f"Не удалось отправить фото собеседнику: {e}", status=502)
+    if not delivered.photo:
+        raise ApiError("Не удалось отправить фото собеседнику.", status=502)
+    file_id = delivered.photo[-1].file_id
+    await save_order_chat_message(order_id, uid, peer["peer_id"], delivered.message_id, "photo", file_id)
+    await log_order_event(order_id, uid, "chat_message", "Новое фото в анонимном чате (Mini App)")
+    await create_notification(peer["peer_id"], "chat", f"💬 Новое сообщение по заявке #{order_id}", "Собеседник отправил фото.", order_id)
+    return web.json_response({"ok": True})
+
+
+async def api_order_chat_photo_image(request: web.Request):
+    """Отдаёт байты фото из чата заявки (по Telegram file_id) — для показа
+    вложения прямо в Mini App, без выхода в сам Telegram."""
+    uid = request["uid"]
+    order_id = int(request.match_info["order_id"])
+    message_id = int(request.match_info["message_id"])
+    await _load_order_for_participant(order_id, uid)
+    msg = await get_chat_message(order_id, message_id)
+    if not msg or msg["content_type"] != "photo" or not msg["text_content"]:
+        raise ApiError("Фото недоступно.", status=404)
+    bot = request.app["bot"]
+    buf = io.BytesIO()
+    try:
+        await bot.download(msg["text_content"], destination=buf)
+    except Exception as e:
+        print(f"[webapp chat photo] {e}")
+        raise ApiError("Не удалось загрузить фото.", status=502)
+    buf.seek(0)
+    return web.Response(body=buf.read(), content_type="image/jpeg")
 
 
 # ---------- Исполнитель ----------
@@ -751,6 +823,8 @@ def setup_webapp_routes(app: web.Application, bot_token: str, static_dir: str):
     app.router.add_post("/api/orders/{order_id}/rate", api_order_rate)
     app.router.add_get("/api/orders/{order_id}/chat", api_order_chat_list)
     app.router.add_post("/api/orders/{order_id}/chat", api_order_chat_send)
+    app.router.add_post("/api/orders/{order_id}/chat/photo", api_order_chat_send_photo)
+    app.router.add_get("/api/orders/{order_id}/chat/{message_id}/photo", api_order_chat_photo_image)
 
     app.router.add_post("/api/executor/apply", api_executor_apply)
     app.router.add_post("/api/executor/apply/{app_id}/answer", api_executor_apply_answer)

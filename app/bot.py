@@ -210,6 +210,7 @@ class UserStates(StatesGroup):
     waiting_payment_details = State()
     waiting_operator = State()
     waiting_operator_custom = State()
+    waiting_dispute_reason = State()
     executor_experience = State()
     executor_services = State()
     executor_comment = State()
@@ -1622,22 +1623,53 @@ async def order_rating_submit(c: CallbackQuery):
     await c.answer("Спасибо за оценку!")
 
 @dp.callback_query(F.data.startswith("order:dispute:"))
-async def client_dispute_order(c: CallbackQuery):
-    order_id=int(c.data.split(":")[2])
-    executor_id=await dispute_order_by_client(order_id,c.from_user.id)
+async def client_dispute_order_prompt(c: CallbackQuery, state: FSMContext):
+    order_id = int(c.data.split(":")[2])
+    await state.update_data(dispute_order_id=order_id)
+    await state.set_state(UserStates.waiting_dispute_reason)
+    await c.message.edit_text(
+        f"⚠️ <b>Спор по заявке #{order_id}</b>\n\nОпишите проблему одним сообщением — это увидит администратор и поможет быстрее разобраться.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="❌ Отмена", callback_data="back")]]),
+        parse_mode="HTML"
+    )
+    await c.answer()
+
+@dp.message(UserStates.waiting_dispute_reason)
+async def client_dispute_reason(m: Message, state: FSMContext):
+    if not m.text or not m.text.strip():
+        await m.answer("❌ Опишите проблему текстом.")
+        return
+    reason = m.text.strip()[:500]
+    data = await state.get_data()
+    order_id = data.get("dispute_order_id")
+    await state.clear()
+    if not order_id:
+        await m.answer("❌ Не найдена заявка для спора. Откройте её заново из списка заявок.", reply_markup=back())
+        return
+    executor_id = await dispute_order_by_client(order_id, m.from_user.id, reason=reason)
     if executor_id is None:
-        await c.answer("Заявка уже обработана или недоступна.",show_alert=True); return
-    await log_order_event(order_id, c.from_user.id, "dispute_opened", "Клиент открыл спор")
-    await create_notification(executor_id, "dispute", f"⚖️ Спор по заявке #{order_id}", "Клиент открыл спор.", order_id)
+        await m.answer("Заявка уже обработана или недоступна.", reply_markup=back())
+        return
+    await log_order_event(order_id, m.from_user.id, "dispute_opened", f"Клиент открыл спор: {reason}")
+    await create_notification(executor_id, "dispute", f"⚖️ Спор по заявке #{order_id}", reason, order_id)
     try:
-        await c.bot.send_message(executor_id, f"⚠️ <b>По заявке #{order_id} открыт спор.</b>\n\nСредства остаются в резерве до решения администрации.", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Открыть чат",callback_data=f"chat:open:{order_id}")]]), parse_mode="HTML")
-    except Exception as e: print(f"[Notify dispute executor] {e}")
+        await m.bot.send_message(
+            executor_id,
+            f"⚠️ <b>По заявке #{order_id} открыт спор.</b>\n\n<b>Причина:</b> {escape(reason)}\n\nСредства остаются в резерве до решения администрации.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="💬 Открыть чат", callback_data=f"chat:open:{order_id}")]]), parse_mode="HTML")
+    except Exception as e:
+        print(f"[Notify dispute executor] {e}")
     for admin_id in await get_admin_ids():
         try:
-            await c.bot.send_message(admin_id, f"⚠️ <b>Открыт спор по заявке #{order_id}</b>\n\nКлиент: <code>{c.from_user.id}</code>\nИсполнитель: <code>{executor_id}</code>", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚖️ Открыть спор",callback_data=f"adm:dispute:{order_id}")]]), parse_mode="HTML")
-        except Exception as e: print(f"[Dispute admin notify] {e}")
-    await c.message.edit_text(f"⚠️ <b>Заявка #{order_id} передана в спор.</b>\n\nСредства остаются в резерве. Администрация рассмотрит ситуацию.",reply_markup=back(),parse_mode="HTML")
-    await c.answer("Спор открыт")
+            await m.bot.send_message(
+                admin_id,
+                f"⚠️ <b>Открыт спор по заявке #{order_id}</b>\n\nКлиент: <code>{m.from_user.id}</code>\nИсполнитель: <code>{executor_id}</code>\n\n<b>Причина:</b> {escape(reason)}",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⚖️ Открыть спор", callback_data=f"adm:dispute:{order_id}")]]), parse_mode="HTML")
+        except Exception as e:
+            print(f"[Dispute admin notify] {e}")
+    await m.answer(
+        f"⚠️ <b>Заявка #{order_id} передана в спор.</b>\n\nСредства остаются в резерве. Администрация рассмотрит ситуацию.",
+        reply_markup=back(), parse_mode="HTML")
 
 @dp.callback_query(F.data == "exec:myorders")
 async def executor_my_orders(c: CallbackQuery):

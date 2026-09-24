@@ -355,6 +355,7 @@ async def init_db():
         await _add_column_if_missing(conn, "orders", "completed_at", "TIMESTAMPTZ")
         await _add_column_if_missing(conn, "orders", "confirmed_at", "TIMESTAMPTZ")
         await _add_column_if_missing(conn, "orders", "disputed_at", "TIMESTAMPTZ")
+        await _add_column_if_missing(conn, "orders", "dispute_reason", "TEXT")
         await _add_column_if_missing(conn, "orders", "settled_at", "TIMESTAMPTZ")
         await _add_column_if_missing(conn, "orders", "escrow_amount_usdt", "NUMERIC(18,4) NOT NULL DEFAULT 0")
         await _add_column_if_missing(conn, "orders", "settlement_for", "TEXT")
@@ -728,12 +729,13 @@ async def confirm_order_by_client(order_id, client_id):
             await conn.execute("INSERT INTO transactions(user_id,order_id,amount,type,description) VALUES($1,$2,$3,'executor_payout',$4)", row[1], order_id, payout, f"Выплата за заявку #{order_id}")
             return row[1], payout
 
-async def dispute_order_by_client(order_id, client_id):
+async def dispute_order_by_client(order_id, client_id, reason=None):
+    reason = (str(reason).strip()[:500] or None) if reason else None
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
-            """UPDATE orders SET status='disputed', disputed_at=now()
+            """UPDATE orders SET status='disputed', disputed_at=now(), dispute_reason=$3
                WHERE id=$1 AND user_id=$2 AND status='awaiting_confirmation'
-               RETURNING executor_id""", order_id, client_id)
+               RETURNING executor_id""", order_id, client_id, reason)
         return row[0] if row else None
 
 async def auto_dispute_stale_orders(timeout_minutes=60):
@@ -1244,7 +1246,7 @@ async def get_order(order_id):
             """SELECT o.id, o.user_id, u.username, s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
                       o.owner_commission_amount, o.executor_commission_amount, o.status,
                       o.executor_id, o.created_at, o.payment_method, o.payment_details, o.payment_file_id, o.order_comment,
-                      o.card_binding_requested
+                      o.card_binding_requested, o.dispute_reason
                FROM orders o
                JOIN services s ON s.id = o.service_id
                JOIN users u ON u.user_id = o.user_id
@@ -1658,7 +1660,7 @@ async def get_disputed_orders(limit=30):
             """SELECT o.id, o.user_id, cu.username AS client_username,
                       o.executor_id, eu.username AS executor_username,
                       s.name, o.amount_rub, o.user_amount_usdt, o.total_amount_usdt,
-                      o.status, o.created_at, o.disputed_at, o.settlement_for
+                      o.status, o.created_at, o.disputed_at, o.settlement_for, o.dispute_reason
                FROM orders o
                JOIN services s ON s.id=o.service_id
                JOIN users cu ON cu.user_id=o.user_id
@@ -1790,6 +1792,15 @@ async def get_order_chat_messages_after(order_id, after_id=0, limit=100):
             SELECT id,sender_id,content_type,text_content,created_at
             FROM order_chat_messages WHERE order_id=$1 AND id > $2 ORDER BY id ASC LIMIT $3
         """, order_id, after_id, limit)
+
+async def get_chat_message(order_id, message_id):
+    """Одно сообщение чата — для отдачи фото по запросу мини-аппа
+    (text_content хранит Telegram file_id для content_type='photo')."""
+    async with pool.acquire() as conn:
+        return await conn.fetchrow(
+            "SELECT id,sender_id,content_type,text_content FROM order_chat_messages WHERE id=$1 AND order_id=$2",
+            message_id, order_id,
+        )
 
 async def get_order_counts_by_status():
     async with pool.acquire() as conn:
