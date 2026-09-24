@@ -102,6 +102,22 @@
     return 'spark';
   }
 
+  var SERVICE_ICON_IMAGES = {
+    mobile: "icon-mobile.png",
+    qr: "icon-qr.png",
+    card: "icon-card.png",
+    sbp: "icon-sbp.png",
+    executor_card: "icon-executor-card.png"
+  };
+  function serviceIconHtml(name) {
+    var key = serviceIcon(name);
+    var img = SERVICE_ICON_IMAGES[key];
+    return img ? '<img src="' + img + '" alt="">' : svgIcon(key);
+  }
+  function serviceIconClass(name) {
+    return SERVICE_ICON_IMAGES[serviceIcon(name)] ? " has-image" : "";
+  }
+
   function fmt(n, digits) {
     digits = digits == null ? 2 : digits;
     n = Number(n || 0);
@@ -420,7 +436,7 @@
       if (!box) return;
       box.innerHTML = services.slice(0, 5).map(function (s) {
         return '<div class="home-service" data-id="' + s.id + '">' +
-          '<span class="service-icon compact">' + svgIcon(serviceIcon(s.name)) + '</span>' +
+          '<span class="service-icon compact' + serviceIconClass(s.name) + '">' + serviceIconHtml(s.name) + '</span>' +
           '<span class="service-main"><span class="service-title">' + esc(cleanServiceName(s.name)) + '</span><span class="muted">' + esc(s.description || '') + '</span></span>' +
           '<span class="service-arrow">' + svgIcon('arrow') + '</span></div>';
       }).join('');
@@ -477,7 +493,7 @@
       root.innerHTML = '<h1>Услуги</h1>' + services.map(function (s) {
         var minRub = Number(s.min_amount) * rate;
         return '<div class="card tappable service-card" data-id="' + s.id + '">' +
-          '<div class="service-icon">' + svgIcon(serviceIcon(s.name)) + '</div>' +
+          '<div class="service-icon' + serviceIconClass(s.name) + '">' + serviceIconHtml(s.name) + '</div>' +
           '<div class="service-main">' +
           '<div class="service-title">' + esc(cleanServiceName(s.name)) + "</div>" +
           (s.description ? '<div class="muted" style="margin-top:4px">' + esc(s.description) + "</div>" : "") +
